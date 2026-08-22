@@ -1,0 +1,12 @@
+node_modules/
+lib/
+coverage/
+.forgeyard/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+forgeyard-worktrees/
+*.tgz
+*.log
+profiles/local/node_modules/
+profiles/local/pnpm-lock.yaml

@@ -1,0 +1,16 @@
+{
+  "name": "dsh-profile-forgeyard-local",
+  "private": true,
+  "dependencies": {
+    "forgeyard": "link:../../packages/forgeyard"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "forgeyard"
+      ]
+    }
+  }
+}

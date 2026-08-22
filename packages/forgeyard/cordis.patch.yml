@@ -1,0 +1,18 @@
+# One row owns both Forgeyard's Host service and the package-declared Web client.
+- insert:
+    - id: forgeyard
+      name: forgeyard
+      config:
+        databasePath: !!js dshHomePath('forgeyard.sqlite')
+        worktreeRoot: !!js dshHomePath('forgeyard-worktrees')
+        allowedRepositoryRoots: !!js "process.env.FORGEYARD_REPOSITORY_ROOT ? [process.env.FORGEYARD_REPOSITORY_ROOT] : []"
+        defaultProvider: deepseek-official
+        defaultModel: deepseek-v4-flash
+        defaultReasoningEffort: high
+        defaultAgentPreset: ''
+        defaultPermissionPreset: workspace-write
+        verifierTimeoutMs: 600000
+        gitTimeoutMs: 120000
+        outputLimitBytes: 262144
+        spillLimitBytes: 67108864
+        diffLimitBytes: 262144

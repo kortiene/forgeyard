@@ -1,0 +1,6 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/forgeyard/tsconfig.host.json" }
+  ]
+}
