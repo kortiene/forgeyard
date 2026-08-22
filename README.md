@@ -97,7 +97,19 @@ pnpm smoke:profile
 
 On a host with a usable DSH sandbox backend, Attempt 2's verifier passes and the exact digest is approved. On a host without one, both Attempts require `ERROR`, approval is proven blocked, Attempt 1 remains immutable with `RETRY`, and Attempt 2 records `REJECT`; the verifier never runs unconfined.
 
-The DSH contract suite separately executes the emitted browser bundle in a browser DOM, mounts its three slot contributions, opens the Cockpit, invokes `ctx.sessions.open(id)`, and returns through the Session-header action to the exact Attempt. This is an emitted-bundle compatibility test, not a full graphical-browser automation of the assembled profile; perform the same round trip manually before treating a release build as accepted.
+The DSH contract suite separately executes the emitted browser bundle in a browser DOM, mounts its three slot contributions, opens the Cockpit, invokes `ctx.sessions.open(id)`, and returns through the Session-header action to the exact Attempt. The assembled-browser acceptance harness then drives that same round trip in a real Chromium against the real pinned graphical profile:
+
+```sh
+pnpm smoke:browser
+```
+
+The provider-driven acceptance harness requires a usable configured provider and full DSH sandbox enforcement. It runs two real native Attempts: Attempt 1 reaches a complete approvable `PASS` and is sealed by `RETRY`; Attempt 2 uses a new Session/worktree, reaches `PASS`, and is bound to `APPROVE`. It fails closed with the exact public `session.history` `turn/end` provider error when a route cannot execute:
+
+```sh
+pnpm smoke:native
+```
+
+See [the Milestone 1 acceptance runbook](docs/milestone-1-acceptance.md) for case-sensitive filesystem requirements, provider overrides, evidence assertions, and fail-closed interpretation.
 
 This `DSH_HOME=$PWD` arrangement is a development convenience. Do not select the Forgeyard checkout itself as a Mission repository in that arrangement: an Attempt worktree root must be outside its selected base repository. Use a separate DSH home/profile installation for that case.
 

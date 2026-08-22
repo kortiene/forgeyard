@@ -21,6 +21,8 @@
     "test:real-git": "vitest run tests/real-git",
     "test:vertical-slice": "vitest run tests/vertical-slice",
     "smoke:profile": "node scripts/profile-smoke.mjs",
+    "smoke:browser": "node scripts/browser-roundtrip.mjs",
+    "smoke:native": "node scripts/native-attempt-acceptance.mjs",
     "check": "pnpm run build && pnpm run test && pnpm run smoke:profile"
   },
   "devDependencies": {

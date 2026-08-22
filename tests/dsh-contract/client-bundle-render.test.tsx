@@ -49,6 +49,14 @@ describe('built Forgeyard browser face', () => {
         open: opened,
       },
       effect: (install: () => (() => void)) => { cleanups.push(install()) },
+      plugin: (definition: { apply: (scope: unknown) => void | Promise<void> }) => {
+        // Model DSH's child-fiber apply: the emitted bundle mounts its Remote,
+        // then contributes the Cockpit from a nested plugin that injects
+        // `remote.forgeyard`. In the assembled runtime that guard is what makes
+        // `ctx.remote.forgeyard` resolvable; here the child shares the same fake
+        // services, so applying it against this ctx exercises the same path.
+        void definition.apply(ctx)
+      },
       slots: {
         inject: (_name: string, install: () => void) => { install() },
         register: (options: SlotEntry['options'], component: SlotEntry['component']) => {
