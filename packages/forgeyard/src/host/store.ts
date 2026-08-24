@@ -9,6 +9,9 @@ import type {
   EvidenceRecord,
   MissionId,
   MissionRecord,
+  PromotionId,
+  PromotionRecord,
+  PromotionStatus,
   TaskId,
   TaskRecord,
   VerificationRecord,
@@ -129,6 +132,33 @@ function verificationOf(row: Row): VerificationRecord {
   }
 }
 
+function promotionOf(row: Row): PromotionRecord {
+  return {
+    id: String(row.id),
+    attemptId: String(row.attempt_id),
+    decisionId: String(row.decision_id),
+    reviewDigest: String(row.review_digest),
+    executionSnapshotHash: String(row.execution_snapshot_hash),
+    baseCommit: String(row.base_commit),
+    worktreeHead: String(row.worktree_head),
+    evidenceDigest: String(row.evidence_digest),
+    verificationDigest: String(row.verification_digest),
+    projection: parse(row.projection_json),
+    projectionHash: String(row.projection_hash),
+    objectFormat: String(row.object_format) as PromotionRecord['objectFormat'],
+    outputRef: String(row.output_ref),
+    outputCommit: String(row.output_commit),
+    outputTree: String(row.output_tree),
+    status: String(row.status) as PromotionStatus,
+    actor: String(row.actor),
+    rationale: String(row.rationale),
+    failureReason: row.failure_reason === null ? null : String(row.failure_reason),
+    hash: String(row.hash),
+    createdAt: Number(row.created_at),
+    settledAt: row.settled_at === null ? null : Number(row.settled_at),
+  }
+}
+
 function decisionOf(row: Row): DecisionRecord {
   return {
     id: String(row.id),
@@ -198,6 +228,52 @@ export function assertVerificationRecordIntegrity(record: VerificationRecord): v
     createdAt: record.createdAt,
   }
   if (hashRecord(core) !== record.hash) throw new Error(`Verification ${record.id} content hash is invalid`)
+}
+
+/**
+ * The immutable half of a Promotion. `status`, `failureReason`, and `settledAt`
+ * are the single settle-once lifecycle transition and are deliberately outside
+ * the hash so the durable output binding cannot be rewritten by settling.
+ */
+export type PromotionAuthority = Omit<
+  PromotionRecord,
+  'id' | 'projection' | 'status' | 'failureReason' | 'hash' | 'settledAt'
+>
+
+export function promotionCore(record: PromotionAuthority): Record<string, unknown> {
+  return {
+    attemptId: record.attemptId,
+    decisionId: record.decisionId,
+    reviewDigest: record.reviewDigest,
+    executionSnapshotHash: record.executionSnapshotHash,
+    baseCommit: record.baseCommit,
+    worktreeHead: record.worktreeHead,
+    evidenceDigest: record.evidenceDigest,
+    verificationDigest: record.verificationDigest,
+    projectionHash: record.projectionHash,
+    objectFormat: record.objectFormat,
+    outputRef: record.outputRef,
+    outputCommit: record.outputCommit,
+    outputTree: record.outputTree,
+    actor: record.actor,
+    rationale: record.rationale,
+    createdAt: record.createdAt,
+  }
+}
+
+export function assertPromotionRecordIntegrity(record: PromotionRecord): void {
+  const projection = record.projection
+  const canonical = canonicalJson({ ...projection, canonical: undefined, hash: undefined })
+  if (projection.version !== 1 || projection.canonical !== canonical
+    || sha256(projection.canonical) !== projection.hash || projection.hash !== record.projectionHash) {
+    throw new Error(`Promotion ${record.id} projection hash is invalid`)
+  }
+  if (projection.promoted.count + projection.excluded.count !== projection.manifestEntryCount) {
+    throw new Error(`Promotion ${record.id} projection does not classify every reviewed workspace entry`)
+  }
+  if (hashRecord(promotionCore(record)) !== record.hash) {
+    throw new Error(`Promotion ${record.id} content hash is invalid`)
+  }
 }
 
 /** Relational authority for Forgeyard. DSH Session persistence remains separate. */
@@ -594,6 +670,76 @@ export class ForgeyardStore {
 
   decisions(attemptId: AttemptId): DecisionRecord[] {
     return (this.database.prepare('SELECT * FROM decisions WHERE attempt_id=? ORDER BY created_at,id').all(attemptId) as Row[]).map(decisionOf)
+  }
+
+  /**
+   * Record the intent to promote before any Git ref exists.
+   *
+   * The row is written inside `BEGIN IMMEDIATE` so a concurrent promotion of
+   * the same Attempt (or the same Forgeyard ref) loses on the partial unique
+   * indexes rather than racing `git update-ref`.
+   */
+  insertPendingPromotion(record: PromotionRecord): void {
+    if (record.status !== 'pending' || record.failureReason !== null || record.settledAt !== null) {
+      throw new Error('a Promotion is recorded as pending before its Git ref is created')
+    }
+    assertPromotionRecordIntegrity(record)
+    this.immediate(() => {
+      const attempt = this.attempt(record.attemptId)
+      if (attempt === undefined) throw new Error(`attempt ${record.attemptId} does not exist`)
+      if (attempt.state !== 'approved') throw new Error(`only an approved Attempt can be promoted (state ${attempt.state})`)
+      const decision = this.decisions(record.attemptId).find(item => item.id === record.decisionId)
+      if (decision === undefined || decision.type !== 'APPROVE' || decision.reviewDigest !== record.reviewDigest) {
+        throw new Error('a Promotion must bind the Attempt\'s exact terminal APPROVE Decision and review digest')
+      }
+      this.database.prepare(`INSERT INTO promotions
+        (id,attempt_id,decision_id,review_digest,execution_snapshot_hash,base_commit,worktree_head,
+         evidence_digest,verification_digest,projection_json,projection_hash,object_format,
+         output_ref,output_commit,output_tree,status,actor,rationale,failure_reason,hash,created_at,settled_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        record.id, record.attemptId, record.decisionId, record.reviewDigest, record.executionSnapshotHash,
+        record.baseCommit, record.worktreeHead, record.evidenceDigest, record.verificationDigest,
+        canonicalJson(record.projection), record.projectionHash, record.objectFormat,
+        record.outputRef, record.outputCommit, record.outputTree, record.status,
+        record.actor, record.rationale, record.failureReason, record.hash, record.createdAt, record.settledAt,
+      )
+    })
+  }
+
+  settlePromotion(id: PromotionId, status: 'promoted' | 'failed', failureReason: string | null): PromotionRecord {
+    if ((status === 'failed') !== (failureReason !== null)) {
+      throw new Error('a failed Promotion records exactly one failure reason')
+    }
+    return this.immediate(() => {
+      const current = this.promotion(id)
+      if (current === undefined) throw new Error(`promotion ${id} does not exist`)
+      if (current.status !== 'pending') throw new Error(`promotion ${id} already settled as ${current.status}`)
+      this.database.prepare('UPDATE promotions SET status=?, failure_reason=?, settled_at=? WHERE id=?')
+        .run(status, failureReason === null ? null : failureReason.slice(0, 20_000), Date.now(), id)
+      return this.promotion(id) as PromotionRecord
+    })
+  }
+
+  promotion(id: PromotionId): PromotionRecord | undefined {
+    const row = this.database.prepare('SELECT * FROM promotions WHERE id=?').get(id) as Row | undefined
+    return row === undefined ? undefined : promotionOf(row)
+  }
+
+  promotions(attemptId: AttemptId): PromotionRecord[] {
+    return (this.database.prepare('SELECT * FROM promotions WHERE attempt_id=? ORDER BY created_at,id')
+      .all(attemptId) as Row[]).map(promotionOf)
+  }
+
+  /** The one Promotion that presently owns this Attempt's Forgeyard ref, if any. */
+  activePromotion(attemptId: AttemptId): PromotionRecord | undefined {
+    const row = this.database.prepare("SELECT * FROM promotions WHERE attempt_id=? AND status<>'failed'")
+      .get(attemptId) as Row | undefined
+    return row === undefined ? undefined : promotionOf(row)
+  }
+
+  pendingPromotions(): PromotionRecord[] {
+    return (this.database.prepare("SELECT * FROM promotions WHERE status='pending' ORDER BY created_at,id")
+      .all() as Row[]).map(promotionOf)
   }
 
   recoverUncertainAttempts(): number {

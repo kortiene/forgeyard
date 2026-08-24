@@ -16,6 +16,7 @@ import type {
   EvidenceRecord,
   MissionCreateRequest,
   MissionView,
+  PromotionRecord,
   VerificationStatus,
 } from '../types.ts'
 import type { CockpitSnapshot, ForgeyardCockpitController } from './controller.ts'
@@ -468,6 +469,8 @@ function AttemptReview({
           <VerificationPanel attempt={attempt} />
           <EvidencePanel evidence={attempt.evidence} />
           <DecisionHistory attempt={attempt} />
+          {/* Keyed by Attempt so an open confirmation never carries to another one. */}
+          <PromotionPanel key={attempt.attempt.id} cockpit={cockpit} attempt={attempt} busy={busy} />
         </div>
         <aside className="fy-decision-panel">
           <p className="fy-eyebrow">Decision gate</p>
@@ -508,6 +511,122 @@ function AttemptReview({
         </aside>
       </section>
     </div>
+  )
+}
+
+/**
+ * The local delivery gate. Approval authorizes a reviewed state; promotion is a
+ * separate explicit action that requires confirming the exact approved digest.
+ */
+function PromotionPanel({
+  cockpit,
+  attempt,
+  busy,
+}: {
+  readonly cockpit: ForgeyardCockpitController
+  readonly attempt: AttemptView
+  readonly busy: boolean
+}): ReactNode {
+  const [confirming, setConfirming] = useState(false)
+  const [actor, setActor] = useState('local-user')
+  const [rationale, setRationale] = useState('')
+  const eligibility = attempt.promotion
+  const digest = eligibility.reviewDigest
+  const ready = actor.trim().length > 0 && rationale.trim().length > 0 && digest !== null
+  const settled = [...attempt.promotions].reverse()
+
+  return (
+    <section className="fy-section fy-promotion" data-promotion-status={eligibility.status}>
+      <div className="fy-section-title">
+        <div>
+          <p className="fy-eyebrow">Local delivery</p>
+          <h2>Promotion</h2>
+        </div>
+        <StatusPill state={eligibility.status} />
+      </div>
+      <p className="fy-promotion-reason">
+        {eligibility.reason ?? 'This approved deliverable can be promoted to a durable Forgeyard-owned local Git ref.'}
+      </p>
+      <dl className="fy-command-evidence">
+        <div><dt>Approved digest</dt><dd><code>{digest ?? 'None'}</code></dd></div>
+        <div><dt>Output ref</dt><dd><code>{eligibility.outputRef ?? eligibility.plannedRef ?? 'Unavailable'}</code></dd></div>
+        <div><dt>Output commit</dt><dd><code>{eligibility.outputCommit ?? 'Not promoted'}</code></dd></div>
+        {eligibility.failureReason === null
+          ? null
+          : <div><dt>Last failure</dt><dd>{eligibility.failureReason}</dd></div>}
+      </dl>
+      {!eligibility.eligible ? null : confirming ? (
+        <div className="fy-promotion-confirm">
+          <p>
+            Confirm promoting review digest <code>{digest}</code> into{' '}
+            <code>{eligibility.plannedRef}</code>. Forgeyard revalidates the live Attempt immediately
+            before writing and never pushes anything remotely.
+          </p>
+          <Field label="Actor">
+            <input value={actor} onChange={event => { setActor(event.target.value) }} />
+          </Field>
+          <Field label="Rationale">
+            <textarea rows={3} value={rationale} onChange={event => { setRationale(event.target.value) }} />
+          </Field>
+          <div className="fy-decision-actions">
+            <button
+              type="button"
+              className="fy-primary"
+              disabled={busy || !ready}
+              onClick={() => {
+                if (digest === null) return
+                void cockpit.promote({
+                  attemptId: attempt.attempt.id,
+                  actor: actor.trim(),
+                  rationale: rationale.trim(),
+                  expectedReviewDigest: digest,
+                })
+              }}
+            >
+              Confirm promotion
+            </button>
+            <button type="button" className="fy-secondary" disabled={busy} onClick={() => { setConfirming(false) }}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button
+          type="button"
+          className="fy-primary fy-promote"
+          disabled={busy}
+          onClick={() => { setConfirming(true) }}
+        >
+          Promote approved deliverable…
+        </button>
+      )}
+      {settled.length === 0 ? null : (
+        <div className="fy-check-list">
+          {settled.map(record => <PromotionRow key={record.id} record={record} />)}
+        </div>
+      )}
+    </section>
+  )
+}
+
+function PromotionRow({ record }: { readonly record: PromotionRecord }): ReactNode {
+  const projection = record.projection
+  const dropped = projection.excludedByReason.find(entry => entry.reason === 'directory-dropped')?.count ?? 0
+  const ignored = projection.excludedByReason.find(entry => entry.reason === 'ignored')?.count ?? 0
+  return (
+    <article className="fy-check">
+      <StatusPill state={record.status} />
+      <div>
+        <strong>{record.actor}</strong>
+        <code>{record.outputRef} · {shortHash(record.outputCommit)} · {formatTime(record.createdAt)}</code>
+        <p>{record.failureReason ?? record.rationale}</p>
+        <small>
+          {projection.promoted.count} promoted · {ignored} ignored · {dropped} dropped directories ·{' '}
+          {projection.unrepresentableModes.count} unrepresentable modes · projection {shortHash(projection.hash)}
+          {projection.promoted.previewTruncated || projection.excluded.previewTruncated ? ' · ledger preview bounded' : ''}
+        </small>
+      </div>
+    </article>
   )
 }
 
@@ -748,8 +867,10 @@ function humanize(value: string): string {
 }
 
 function toneForState(state: string): 'good' | 'bad' | 'active' | 'neutral' {
-  if (state === 'approved') return 'good'
-  if (state === 'rejected' || state === 'cancelled' || state === 'interrupted') return 'bad'
-  if (state === 'running' || state === 'verifying' || state === 'awaiting_decision') return 'active'
+  if (state === 'approved' || state === 'promoted') return 'good'
+  if (state === 'rejected' || state === 'cancelled' || state === 'interrupted'
+    || state === 'failed' || state === 'blocked') return 'bad'
+  if (state === 'running' || state === 'verifying' || state === 'awaiting_decision'
+    || state === 'eligible' || state === 'pending' || state === 'uncertain') return 'active'
   return 'neutral'
 }

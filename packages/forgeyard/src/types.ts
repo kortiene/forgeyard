@@ -6,6 +6,7 @@ export type AttemptId = string
 export type EvidenceId = string
 export type VerificationId = string
 export type DecisionId = string
+export type PromotionId = string
 
 export type AttemptState =
   | 'preparing'
@@ -23,6 +24,23 @@ export type AttemptState =
 
 export type VerificationStatus = 'PASS' | 'FAIL' | 'ERROR' | 'INCOMPLETE'
 export type DecisionType = 'APPROVE' | 'REJECT' | 'RETRY' | 'CANCEL'
+export type PromotionStatus = 'pending' | 'promoted' | 'failed'
+
+/**
+ * How one reviewed raw-workspace entry is treated by the promotion projection.
+ * Every entry of the reviewed manifest receives exactly one of these outcomes.
+ */
+export type PromotionOutcome =
+  /** Carried into the promoted Git tree as a blob with a Git file mode. */
+  | 'promoted'
+  /** The linked-worktree `.git` administrative entry (and anything below it). */
+  | 'git-admin'
+  /** Git-ignored file or symlink; excluded by the declared projection. */
+  | 'ignored'
+  /** A directory with at least one promoted descendant; Git implies it from paths. */
+  | 'directory-implied'
+  /** A directory with no promoted descendant; Git cannot represent it at all. */
+  | 'directory-dropped'
 
 export interface RepositorySnapshot {
   path: string
@@ -257,6 +275,125 @@ export interface DecisionRecord {
   createdAt: number
 }
 
+/**
+ * One entry carried into the promoted Git tree.
+ *
+ * `contentHash` is the SHA-256 of the exact reviewed bytes (a regular file's
+ * content, or a symlink's raw target bytes). `blobOid` is the Git object name
+ * Forgeyard computed for those same bytes in the same read; the promoted tree
+ * is accepted only when Git independently produced the identical object name.
+ */
+export interface PromotedEntry {
+  path: string
+  type: 'file' | 'symlink'
+  /** `100644`, `100755`, or `120000`. */
+  gitMode: string
+  /** The exact reviewed POSIX mode bits, which Git does not carry. */
+  mode: string
+  sizeBytes: string
+  contentHash: string
+  blobOid: string
+}
+
+export interface ExcludedEntry {
+  path: string
+  type: 'directory' | 'file' | 'symlink'
+  reason: Exclude<PromotionOutcome, 'promoted'>
+}
+
+/** A promoted entry whose reviewed permission bits Git will not reproduce. */
+export interface UnrepresentableMode {
+  path: string
+  /** The reviewed POSIX mode bits. */
+  mode: string
+  gitMode: string
+  /** The permission bits `gitMode` canonically denotes: `420` (0644) or `493` (0755). */
+  canonicalMode: string
+}
+
+export interface PromotionLedgerSection<T> {
+  count: number
+  /** SHA-256 over the complete canonical list, whether or not the preview is bounded. */
+  hash: string
+  preview: T[]
+  previewTruncated: boolean
+}
+
+/**
+ * The declared, total promotion projection of one reviewed raw workspace.
+ *
+ * Every entry of the reviewed manifest appears in exactly one section, so
+ * `promoted.count + excluded.count` equals the reviewed manifest entry count.
+ * Section hashes always cover the complete list; previews are bounded for
+ * rendering only and never authorize anything on their own.
+ */
+export interface PromotionProjection {
+  version: 1
+  projector: string
+  projectorVersion: string
+  /** The reviewed raw-workspace manifest hash this projection was computed from. */
+  workspaceHash: string
+  manifestEntryCount: number
+  promoted: PromotionLedgerSection<PromotedEntry>
+  excluded: PromotionLedgerSection<ExcludedEntry>
+  excludedByReason: { reason: Exclude<PromotionOutcome, 'promoted'>; count: number; hash: string }[]
+  unrepresentableModes: PromotionLedgerSection<UnrepresentableMode>
+  /** Constant statement of reviewed facts a Git tree structurally cannot carry. */
+  notCarried: string[]
+  canonical: string
+  hash: string
+}
+
+export interface PromotionRecord {
+  id: PromotionId
+  attemptId: AttemptId
+  decisionId: DecisionId
+  reviewDigest: string
+  executionSnapshotHash: string
+  baseCommit: string
+  /** The Attempt worktree HEAD at promotion time; content, not history, is promoted. */
+  worktreeHead: string
+  evidenceDigest: string
+  verificationDigest: string
+  projection: PromotionProjection
+  projectionHash: string
+  objectFormat: 'sha1' | 'sha256'
+  outputRef: string
+  outputCommit: string
+  outputTree: string
+  status: PromotionStatus
+  actor: string
+  rationale: string
+  failureReason: string | null
+  hash: string
+  createdAt: number
+  settledAt: number | null
+}
+
+export type PromotionEligibilityStatus = 'eligible' | 'blocked' | 'promoted' | 'uncertain'
+
+export interface PromotionEligibility {
+  status: PromotionEligibilityStatus
+  eligible: boolean
+  reason: string | null
+  /** The exact digest an operator must confirm to promote. */
+  reviewDigest: string | null
+  decisionId: DecisionId | null
+  plannedRef: string | null
+  promotionId: PromotionId | null
+  outputRef: string | null
+  outputCommit: string | null
+  failureReason: string | null
+}
+
+export interface PromoteRequest {
+  attemptId: AttemptId
+  actor: string
+  rationale: string
+  /** Explicit operator confirmation of the exact approved review digest. */
+  expectedReviewDigest: string
+}
+
 export interface ReviewState {
   reviewDigest: string
   liveGitFingerprint: string
@@ -264,6 +401,8 @@ export interface ReviewState {
   requiredVerificationCount: number
   passingVerificationCount: number
   canApprove: boolean
+  /** Whether the live reviewed state still matches its recorded authority exactly. */
+  reviewedStateCurrent: boolean
   approvalStale: boolean
   reason: string | null
 }
@@ -274,6 +413,8 @@ export interface AttemptView {
   verifications: VerificationRecord[]
   decisions: DecisionRecord[]
   review: ReviewState
+  promotions: PromotionRecord[]
+  promotion: PromotionEligibility
 }
 
 export interface MissionView {
@@ -335,6 +476,7 @@ export type ForgeyardFailureCode =
   | 'DSH_ERROR'
   | 'VERIFICATION_REQUIRED'
   | 'REVIEW_STALE'
+  | 'PROMOTION_BLOCKED'
   | 'INTERNAL'
 
 export interface ForgeyardFailure {

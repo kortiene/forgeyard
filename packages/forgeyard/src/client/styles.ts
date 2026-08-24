@@ -167,6 +167,13 @@ export const FORGEYARD_CSS = String.raw`
 .fy-evidence-body ul { display: grid; gap: 5px; margin: 0 0 10px; padding: 0; list-style: none; }
 .fy-evidence-body li { display: flex; gap: 8px; font-size: 10px; }
 .fy-evidence-body pre { max-height: 360px; overflow: auto; margin: 0; padding: 12px; border-radius: 8px; background: #17211d; color: #dfeae3; font: 10px/1.5 ui-monospace, monospace; white-space: pre-wrap; }
+.fy-promotion[data-promotion-status="eligible"] { border-color: color-mix(in srgb, var(--fy-green) 45%, transparent); }
+.fy-promotion-reason { padding: 0 12px; color: var(--fy-muted); font-size: 11px; }
+.fy-promotion .fy-command-evidence code { overflow-wrap: anywhere; }
+.fy-promotion-confirm { display: grid; gap: 10px; padding: 0 12px 12px; }
+.fy-promotion-confirm p { color: var(--fy-muted); font-size: 11px; }
+.fy-promotion-confirm code { overflow-wrap: anywhere; }
+.fy-promote { margin: 0 12px 12px; }
 .fy-empty { min-height: 140px; display: grid; place-items: center; align-content: center; gap: 7px; padding: 20px; color: var(--fy-muted); text-align: center; }
 .fy-empty > span { color: var(--fy-green); font-size: 22px; }
 .fy-empty strong { color: var(--fy-ink); font-size: 13px; }

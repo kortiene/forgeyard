@@ -7,31 +7,51 @@ import type {
   AttemptView,
   DecisionRecord,
   DecisionRequest,
+  EvidenceRecord,
   ExecutionSnapshot,
   ForgeyardSnapshot,
+  GitFingerprint,
   MissionCreateRequest,
   MissionId,
   MissionRecord,
   MissionView,
+  PromoteRequest,
+  PromotionEligibility,
+  PromotionRecord,
   ReviewState,
   RetryRequest,
   TaskId,
   TaskRecord,
+  VerificationRecord,
 } from '../types.ts'
 import { parseCommandLine } from './command-line.ts'
 import type { TrustedEvidenceCollector } from './evidence.ts'
 import type { SessionGateway } from './execution.ts'
-import type { CanonicalRepository, GitAuthority, PreparedWorktree } from './git.ts'
+import { GitAuthority, type CanonicalRepository, type PreparedWorktree, type PromotionGitView } from './git.ts'
 import { canonicalJson, forgeyardId, hashRecord, sha256 } from './hash.ts'
-import { assertAttemptRecordIntegrity, type ForgeyardStore } from './store.ts'
+import { assertTreeMatchesProjection, PromotionProjector, type PromotionProjectionResult } from './promotion.ts'
+import {
+  assertAttemptRecordIntegrity,
+  assertPromotionRecordIntegrity,
+  promotionCore,
+  type ForgeyardStore,
+} from './store.ts'
 
 export class ForgeyardDomainError extends Error {
   constructor(
-    readonly code: 'INVALID_REQUEST' | 'NOT_FOUND' | 'INVALID_STATE' | 'GIT_ERROR' | 'DSH_ERROR' | 'VERIFICATION_REQUIRED' | 'REVIEW_STALE',
+    readonly code: 'INVALID_REQUEST' | 'NOT_FOUND' | 'INVALID_STATE' | 'GIT_ERROR' | 'DSH_ERROR'
+      | 'VERIFICATION_REQUIRED' | 'REVIEW_STALE' | 'PROMOTION_BLOCKED',
     message: string,
   ) {
     super(message)
   }
+}
+
+/** The Forgeyard-owned identity every promotion commit is authored with. */
+export const PROMOTION_IDENTITY = { name: 'Forgeyard', email: 'forgeyard@promotion.invalid' } as const
+
+function trailerText(value: string): string {
+  return value.replace(/[\u0000-\u001f\u007f]/gu, ' ').replace(/\s+/gu, ' ').trim().slice(0, 200)
 }
 
 function requiredText(name: string, value: string, max = 20_000): string {
@@ -83,13 +103,20 @@ export class ForgeyardEngine {
    */
   private mutationTail: Promise<void> = Promise.resolve()
 
+  private readonly projector: PromotionProjector
+
   constructor(
     readonly store: ForgeyardStore,
     readonly git: GitAuthority,
     readonly sessions: SessionGateway,
     readonly collector: TrustedEvidenceCollector,
     readonly config: EngineConfig,
-  ) {}
+  ) {
+    this.projector = new PromotionProjector({
+      previewBytes: git.config.reviewDiffBytes,
+      spillBytes: git.config.spillBytes,
+    })
+  }
 
   recoverAfterRestart(): number {
     return this.store.recoverUncertainAttempts()
@@ -452,6 +479,352 @@ export class ForgeyardEngine {
     })
   }
 
+  /**
+   * Promote one approved Attempt into a durable Forgeyard-owned local Git ref.
+   *
+   * Promotion is deliberately separate from approval: `APPROVE` authorizes a
+   * reviewed state, and only this explicit operator action turns that state
+   * into a durable output. It never touches the Attempt's DSH Session. The
+   * terminal Decision already cancelled and drained that execution tree and the
+   * global pre-step guard rejects its later model steps, so re-entering
+   * maintenance would resume a sealed Session instead of fencing anything.
+   * Filesystem drift after that boundary is detected by the live fingerprint,
+   * which is exactly the guarantee the review model claims.
+   */
+  async promote(request: PromoteRequest): Promise<AttemptView> {
+    return this.enqueue(async () => {
+      const actor = requiredText('actor', request.actor, 500)
+      const rationale = requiredText('rationale', request.rationale, 10_000)
+      const confirmed = requiredText('confirmed review digest', request.expectedReviewDigest, 200)
+      if (!/^[0-9a-f]{64}$/u.test(confirmed)) {
+        throw new ForgeyardDomainError('INVALID_REQUEST', 'The confirmed review digest must be a sha256 hex digest.')
+      }
+      // A promotion left uncertain by an interrupted Host must be reconciled
+      // against its Git ref before this Attempt can be promoted again.
+      await this.reconcilePromotionsUnqueued(request.attemptId)
+
+      const attempt = this.requireAttempt(request.attemptId)
+      const review = await this.review(attempt)
+      const eligibility = this.promotionEligibility(attempt, review)
+      if (!eligibility.eligible || eligibility.decisionId === null || eligibility.plannedRef === null) {
+        throw new ForgeyardDomainError('PROMOTION_BLOCKED', eligibility.reason ?? 'This Attempt cannot be promoted.')
+      }
+      const decision = this.store.decisions(attempt.id).find(item => item.id === eligibility.decisionId)
+      if (decision === undefined) throw new ForgeyardDomainError('PROMOTION_BLOCKED', 'The approved Decision is no longer readable.')
+      if (decision.reviewDigest !== confirmed) {
+        throw new ForgeyardDomainError(
+          'PROMOTION_BLOCKED',
+          'The confirmed review digest does not match this Attempt\'s approved review digest; promotion was refused.',
+        )
+      }
+      const task = this.store.task(attempt.taskId)
+      if (task === undefined) throw new ForgeyardDomainError('NOT_FOUND', 'The promoted Attempt references a missing Task.')
+      const runId = review.latestRunId
+      if (runId === null) throw new ForgeyardDomainError('PROMOTION_BLOCKED', 'The approved review has no trusted Evidence run.')
+      const runEvidence = this.store.evidence(attempt.id).filter(item => item.runId === runId)
+      const runVerifications = this.store.verifications(attempt.id).filter(item => item.runId === runId)
+      const gitEvidence = runEvidence.find(item => item.kind === 'git')
+      if (gitEvidence === undefined || gitEvidence.payload.kind !== 'git') {
+        throw new ForgeyardDomainError('PROMOTION_BLOCKED', 'The approved review has no trusted Git Evidence.')
+      }
+      const reviewed = gitEvidence.payload.fingerprint
+
+      let prepared: PreparedWorktree
+      try {
+        prepared = await this.prepared(attempt)
+        await this.git.assertBaseCheckoutSnapshot(prepared.repository, attempt.executionSnapshot.repository)
+      } catch (error) {
+        throw new ForgeyardDomainError('GIT_ERROR', boundedReason('The approved Attempt worktree is not promotable', error))
+      }
+
+      const planned = await this.planPromotion({
+        attempt, task, decision, prepared, reviewed, runEvidence, runVerifications, actor, rationale,
+        ref: eligibility.plannedRef,
+      })
+
+      // Durable intent precedes the ref. `BEGIN IMMEDIATE` plus the partial
+      // unique indexes make a concurrent promotion of the same Attempt or ref
+      // lose here rather than racing Git's ref transaction.
+      try {
+        this.store.insertPendingPromotion(planned.record)
+      } catch (error) {
+        throw new ForgeyardDomainError('PROMOTION_BLOCKED', boundedReason('This Attempt could not enter promotion', error))
+      }
+      try {
+        await this.git.createPromotionRef(prepared.repository.path, planned.record.outputRef, planned.record.outputCommit)
+      } catch (error) {
+        this.failPromotion(planned.record.id, 'The Forgeyard promotion ref was not created', error)
+        throw new ForgeyardDomainError('GIT_ERROR', boundedReason('The Forgeyard promotion ref was not created', error))
+      }
+      try {
+        const written = await this.git.readPromotionRef(prepared.repository.path, planned.record.outputRef)
+        if (written !== planned.record.outputCommit) {
+          throw new Error(`the ref resolves to ${written ?? 'nothing'} instead of the promoted commit`)
+        }
+      } catch (error) {
+        this.failPromotion(
+          planned.record.id,
+          'The Forgeyard promotion ref did not read back as the promoted commit; inspect it manually',
+          error,
+        )
+        throw new ForgeyardDomainError('GIT_ERROR', boundedReason('The Forgeyard promotion ref did not read back', error))
+      }
+      this.store.settlePromotion(planned.record.id, 'promoted', null)
+      return this.attemptViewUnqueued(attempt.id)
+    })
+  }
+
+  /**
+   * Record why a promotion failed without ever replacing the failure itself.
+   * A Promotion left pending because this write also failed is settled by the
+   * next reconciliation against its durable Git ref.
+   */
+  private failPromotion(id: string, prefix: string, cause: unknown): void {
+    try {
+      this.store.settlePromotion(id, 'failed', boundedReason(prefix, cause))
+    } catch {
+      // The original failure remains authoritative.
+    }
+  }
+
+  /**
+   * Compute the projection, write the promoted objects, and prove they are the
+   * declared deliverable — all before any Forgeyard ref exists. Unreferenced
+   * Git objects are inert, so a failure here leaves no durable output at all.
+   */
+  private async planPromotion(input: {
+    attempt: AttemptRecord
+    task: TaskRecord
+    decision: DecisionRecord
+    prepared: PreparedWorktree
+    reviewed: GitFingerprint
+    runEvidence: EvidenceRecord[]
+    runVerifications: VerificationRecord[]
+    actor: string
+    rationale: string
+    ref: string
+  }): Promise<{ record: PromotionRecord }> {
+    const { attempt, task, decision, prepared, reviewed } = input
+    let view: PromotionGitView
+    try {
+      view = await this.git.promotionView(prepared)
+    } catch (error) {
+      throw new ForgeyardDomainError('GIT_ERROR', boundedReason('The approved Attempt worktree could not be read', error))
+    }
+    if (view.fingerprint.digest !== reviewed.digest || view.manifest.hash !== reviewed.workspaceHash
+      || view.fingerprint.baseCommit !== attempt.baseCommit) {
+      throw new ForgeyardDomainError(
+        'REVIEW_STALE',
+        'The Attempt worktree no longer matches the approved review fingerprint; promotion was refused.',
+      )
+    }
+
+    let projected: PromotionProjectionResult
+    let tree: string
+    try {
+      projected = await this.projector.project(prepared.path, view)
+      const written = await this.git.writePromotionTree(prepared, attempt.id, projected.promotedPaths)
+      assertTreeMatchesProjection(projected.promotedEntries, written.entries)
+      assertTreeMatchesProjection(projected.promotedEntries, await this.git.readTreeEntries(prepared, written.tree))
+      tree = written.tree
+    } catch (error) {
+      throw new ForgeyardDomainError(
+        'PROMOTION_BLOCKED',
+        boundedReason('The approved deliverable could not be projected onto an exact Git tree', error),
+      )
+    }
+
+    const evidenceDigest = sha256(input.runEvidence.map(item => item.hash).join('\0'))
+    const verificationDigest = sha256(input.runVerifications.map(item => item.hash).join('\0'))
+    const projection = projected.projection
+    const message = [
+      `forgeyard: promote attempt ${String(attempt.ordinal)} (${attempt.id})`,
+      '',
+      'Forgeyard-owned local promotion of one reviewed Attempt. This commit carries',
+      'only the Git-representable projection of the reviewed workspace; the projection',
+      'ledger records every reviewed entry Git cannot carry.',
+      '',
+      'Forgeyard-Projection-Version: 1',
+      `Forgeyard-Attempt: ${attempt.id}`,
+      `Forgeyard-Attempt-Ordinal: ${String(attempt.ordinal)}`,
+      `Forgeyard-Task: ${task.id}`,
+      `Forgeyard-Mission: ${task.missionId}`,
+      `Forgeyard-Task-Title: ${trailerText(task.specification.title)}`,
+      `Forgeyard-Base-Commit: ${attempt.baseCommit}`,
+      `Forgeyard-Worktree-Head: ${view.headCommit}`,
+      `Forgeyard-Execution-Snapshot: ${attempt.executionSnapshotHash}`,
+      `Forgeyard-Decision: ${decision.id}`,
+      `Forgeyard-Review-Digest: ${decision.reviewDigest}`,
+      `Forgeyard-Evidence-Digest: ${evidenceDigest}`,
+      `Forgeyard-Verification-Digest: ${verificationDigest}`,
+      `Forgeyard-Projection-Hash: ${projection.hash}`,
+      `Forgeyard-Promoted-Entries: ${String(projection.promoted.count)}`,
+      `Forgeyard-Excluded-Entries: ${String(projection.excluded.count)}`,
+      '',
+    ].join('\n')
+
+    let commit: string
+    try {
+      commit = await this.git.createPromotionCommit(prepared, tree, attempt.baseCommit, message, {
+        ...PROMOTION_IDENTITY,
+        // A pinned identity and the approval instant make the same approved
+        // deliverable always name the same commit, so a repeated or recovered
+        // promotion is comparable instead of merely similar.
+        epochSeconds: Math.floor(decision.createdAt / 1000),
+      })
+      if (await this.git.readCommitTree(prepared, commit) !== tree) {
+        throw new Error('the promotion commit does not carry the promoted tree')
+      }
+      // Nothing may have moved while the objects were written. Everything after
+      // this point only creates and reads back the Forgeyard-owned ref.
+      const settled = await this.git.liveFingerprint(prepared)
+      if (settled.digest !== reviewed.digest) throw new Error('the Attempt worktree changed while it was promoted')
+      await this.git.assertBaseCheckoutSnapshot(prepared.repository, attempt.executionSnapshot.repository)
+    } catch (error) {
+      throw new ForgeyardDomainError('GIT_ERROR', boundedReason('The promotion commit could not be proven', error))
+    }
+
+    const core = {
+      attemptId: attempt.id,
+      decisionId: decision.id,
+      reviewDigest: decision.reviewDigest,
+      executionSnapshotHash: attempt.executionSnapshotHash,
+      baseCommit: attempt.baseCommit,
+      worktreeHead: view.headCommit,
+      evidenceDigest,
+      verificationDigest,
+      projectionHash: projection.hash,
+      objectFormat: view.objectFormat,
+      outputRef: input.ref,
+      outputCommit: commit,
+      outputTree: tree,
+      actor: input.actor,
+      rationale: input.rationale,
+      createdAt: Date.now(),
+    }
+    const record: PromotionRecord = {
+      id: forgeyardId('promotion'),
+      ...core,
+      projection,
+      status: 'pending',
+      failureReason: null,
+      hash: hashRecord(promotionCore(core)),
+      settledAt: null,
+    }
+    return { record }
+  }
+
+  /**
+   * Settle promotions that an interrupted Host left uncertain by comparing the
+   * durable Forgeyard ref with the deterministic commit the record names.
+   * Forgeyard never infers success and never rewrites an existing ref.
+   */
+  async reconcilePromotions(): Promise<number> {
+    return this.enqueue(() => this.reconcilePromotionsUnqueued(null))
+  }
+
+  private async reconcilePromotionsUnqueued(attemptId: AttemptId | null): Promise<number> {
+    const pending = this.store.pendingPromotions()
+      .filter(record => attemptId === null || record.attemptId === attemptId)
+    let settled = 0
+    for (const promotion of pending) {
+      const attempt = this.store.attempt(promotion.attemptId)
+      if (attempt === undefined) continue
+      try {
+        // A Promotion whose stored authority does not verify is never settled
+        // from a ref. It stays pending and keeps the Attempt blocked.
+        assertPromotionRecordIntegrity(promotion)
+      } catch {
+        continue
+      }
+      let observed: string | null
+      try {
+        const repository = await this.git.canonicalize(attempt.executionSnapshot.repository.path)
+        this.git.assertRepositorySnapshot(repository, attempt.executionSnapshot.repository)
+        observed = await this.git.readPromotionRef(repository.path, promotion.outputRef)
+      } catch {
+        // The repository is unreadable right now. The Promotion stays pending
+        // and the Cockpit reports it as uncertain rather than guessing.
+        continue
+      }
+      if (observed === promotion.outputCommit) {
+        this.store.settlePromotion(promotion.id, 'promoted', null)
+      } else if (observed === null) {
+        this.store.settlePromotion(
+          promotion.id,
+          'failed',
+          'Forgeyard was interrupted before this promotion created its Git ref. No durable output exists, so the Attempt may be promoted again.',
+        )
+      } else {
+        this.store.settlePromotion(
+          promotion.id,
+          'failed',
+          `${promotion.outputRef} already resolves to ${observed} instead of this promotion's commit ${promotion.outputCommit}. Inspect the ref before promoting again.`,
+        )
+      }
+      settled += 1
+    }
+    return settled
+  }
+
+  /** Whether this exact Attempt may be promoted right now, and why not. */
+  private promotionEligibility(attempt: AttemptRecord, review: ReviewState): PromotionEligibility {
+    const promotions = this.store.promotions(attempt.id)
+    const active = promotions.find(record => record.status !== 'failed')
+    const decision = this.store.decisions(attempt.id).find(record => record.type === 'APPROVE')
+    let plannedRef: string | null = null
+    try {
+      plannedRef = GitAuthority.promotionRef(attempt.id)
+    } catch {
+      plannedRef = null
+    }
+    const base: PromotionEligibility = {
+      status: 'blocked',
+      eligible: false,
+      reason: null,
+      reviewDigest: decision?.reviewDigest ?? null,
+      decisionId: decision?.id ?? null,
+      plannedRef,
+      promotionId: active?.id ?? null,
+      outputRef: active?.outputRef ?? null,
+      outputCommit: active?.outputCommit ?? null,
+      failureReason: (active ?? promotions.at(-1))?.failureReason ?? null,
+    }
+    if (active !== undefined) {
+      try {
+        assertPromotionRecordIntegrity(active)
+      } catch (error) {
+        return { ...base, reason: `The recorded Promotion authority is invalid: ${errorText(error)}` }
+      }
+    }
+    if (active?.status === 'promoted') {
+      return {
+        ...base,
+        status: 'promoted',
+        reason: `This Attempt was already promoted to ${active.outputRef} at ${active.outputCommit}.`,
+      }
+    }
+    if (active?.status === 'pending') {
+      return {
+        ...base,
+        status: 'uncertain',
+        reason: 'A previous promotion did not settle. Forgeyard reconciles it against its Git ref before this Attempt can be promoted again.',
+      }
+    }
+    if (attempt.state !== 'approved') {
+      return { ...base, reason: `Only an Attempt with a terminal APPROVE Decision can be promoted; this Attempt is ${attempt.state}.` }
+    }
+    if (decision === undefined) return { ...base, reason: 'This Attempt has no terminal APPROVE Decision.' }
+    if (!review.reviewedStateCurrent) {
+      return { ...base, reason: review.reason ?? 'The approved reviewed state is no longer current.' }
+    }
+    if (review.reviewDigest !== decision.reviewDigest) {
+      return { ...base, reason: 'The live review digest no longer matches the approved review digest; promotion was refused.' }
+    }
+    if (plannedRef === null) return { ...base, reason: 'This Attempt identifier cannot address a Forgeyard promotion ref.' }
+    return { ...base, status: 'eligible', eligible: true, reason: null }
+  }
+
   async snapshot(): Promise<ForgeyardSnapshot> {
     return this.enqueue(() => this.snapshotUnqueued())
   }
@@ -459,7 +832,7 @@ export class ForgeyardEngine {
   private async snapshotUnqueued(): Promise<ForgeyardSnapshot> {
     const missions: MissionView[] = []
     for (const mission of this.store.missions()) missions.push(await this.missionViewUnqueued(mission.id))
-    return { schemaVersion: 2, dshVersion: this.config.dshVersion, missions }
+    return { schemaVersion: 3, dshVersion: this.config.dshVersion, missions }
   }
 
   async attemptForSession(sessionId: string): Promise<AttemptSessionRef | null> {
@@ -492,12 +865,15 @@ export class ForgeyardEngine {
 
   private async attemptViewUnqueued(attemptId: AttemptId): Promise<AttemptView> {
     const attempt = this.requireAttempt(attemptId)
+    const review = await this.review(attempt)
     return {
       attempt,
       evidence: this.store.evidence(attempt.id),
       verifications: this.store.verifications(attempt.id),
       decisions: this.store.decisions(attempt.id),
-      review: await this.review(attempt),
+      review,
+      promotions: this.store.promotions(attempt.id),
+      promotion: this.promotionEligibility(attempt, review),
     }
   }
 
@@ -577,9 +953,12 @@ export class ForgeyardEngine {
       ...runEvidence.map(record => record.hash),
       ...runVerifications.map(record => record.hash),
     ].join('\0'))
-    const canApprove = attempt.state === 'awaiting_decision' && integrityError === null
-      && liveError === null && baseError === null && !approvalStale && allEvidenceComplete
-      && exactRequirements && passing === required
+    // Whether the recorded review still describes the live state exactly. It is
+    // deliberately independent of Attempt state so a terminal Attempt can be
+    // revalidated before promotion without re-deriving approvability.
+    const reviewedStateCurrent = integrityError === null && liveError === null && baseError === null
+      && !approvalStale && allEvidenceComplete && exactRequirements && passing === required
+    const canApprove = attempt.state === 'awaiting_decision' && reviewedStateCurrent
 
     let reason: string | null = null
     if (integrityError !== null) reason = `Stored review authority is invalid: ${integrityError}`
@@ -597,6 +976,7 @@ export class ForgeyardEngine {
       requiredVerificationCount: required,
       passingVerificationCount: passing,
       canApprove,
+      reviewedStateCurrent,
       approvalStale,
       reason,
     }

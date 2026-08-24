@@ -271,6 +271,7 @@ function apiDouble(
     verifyAttempt: vi.fn(async () => required(firstAttempt, 'attempt fixture')),
     decide: vi.fn(async () => required(firstAttempt, 'attempt fixture')),
     retry: vi.fn(async () => required(firstAttempt, 'attempt fixture')),
+    promote: vi.fn(async () => required(firstAttempt, 'attempt fixture')),
     attemptForSession,
   }
 }
@@ -384,8 +385,22 @@ function attempt(id: string, sessionId: string, ordinal: number): AttemptView {
       requiredVerificationCount: 0,
       passingVerificationCount: 0,
       canApprove: true,
+      reviewedStateCurrent: true,
       approvalStale: false,
       reason: null,
+    },
+    promotions: [],
+    promotion: {
+      status: 'blocked',
+      eligible: false,
+      reason: 'Only an Attempt with a terminal APPROVE Decision can be promoted; this Attempt is awaiting_decision.',
+      reviewDigest: null,
+      decisionId: null,
+      plannedRef: null,
+      promotionId: null,
+      outputRef: null,
+      outputCommit: null,
+      failureReason: null,
     },
   }
 }

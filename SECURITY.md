@@ -1,18 +1,18 @@
 # Forgeyard security model
 
-Forgeyard Milestone 1 is for one trusted operator on one machine. It assumes the engineering agent and repository content may be wrong or adversarial, but it does not provide a hostile multi-user, multi-tenant, or remote-execution boundary.
+Forgeyard is for one trusted operator on one machine. It assumes the engineering agent and repository content may be wrong or adversarial, but it does not provide a hostile multi-user, multi-tenant, or remote-execution boundary.
 
 Do not use this milestone on a repository whose loss or disclosure cannot be tolerated without an independent backup and OS-level containment.
 
 ## Trust boundaries
 
-- The operator authorizes repository roots, supplies the Mission, starts Verification, reviews Evidence, and records Decisions. DSH Agent maintenance—not operator judgment—guards the idle mutation phase.
+- The operator authorizes repository roots, supplies the Mission, starts Verification, reviews Evidence, records Decisions, and explicitly confirms every promotion. DSH Agent maintenance—not operator judgment—guards the idle mutation phase.
 - DeepSeek Harness owns model execution, tools, immediate approvals, the effective Session sandbox, and Session persistence.
-- Forgeyard Host owns the SQLite domain authority, repository/worktree binding, trusted collectors, Verification evaluation, and review digest.
+- Forgeyard Host owns the SQLite domain authority, repository/worktree binding, trusted collectors, Verification evaluation, the review digest, and the promotion projection and its Forgeyard-owned Git output.
 - The model and all agent messages are untrusted claims. They cannot create or modify trusted Evidence records.
 - Repository code and verification commands are untrusted programs. A `PASS` means that the recorded command exited successfully under the recorded conditions; it is not a proof that the command was honest, sufficient, or side-effect-free.
 
-## Controls in Milestone 1
+## Controls
 
 ### Repository and worktree authority
 
@@ -51,11 +51,27 @@ Verification is a separate immutable evaluator record with `PASS`, `FAIL`, `ERRO
 
 An `APPROVE` Decision is append-only and authorizes one deterministic review digest. Forgeyard recomputes the live Git fingerprint and original-checkout state before approval; a changed base checkout, worktree, Evidence set, Verification set, or execution snapshot makes the review stale. Verification claims the exact live parent Agent's maintenance phase, drains its continuable descendant forest, and cancels/awaits its owner-scoped background Jobs before executing verifiers and collecting final Git Evidence. Every terminal Decision cancels and drains the parent and that DSH-owned execution tree, runs its review/transaction under maintenance, then repeats the drain after the release race. A global public `agent/pre-step` listener rejects later model steps for terminal or recovery-uncertain Forgeyard Sessions, including after cold resume.
 
+### Promotion
+
+Promotion is a separate authority from approval. `APPROVE` authorizes one reviewed state; it delivers nothing. A promotion runs only when the Attempt is `approved`, its terminal `APPROVE` Decision still matches the recomputed live review digest, the stored review authority passes the same integrity checks approval required, the original base checkout still matches its frozen HEAD and status, the live worktree fingerprint equals the approved Evidence fingerprint, the live raw-workspace hash equals the reviewed `workspaceHash`, and the operator confirms that exact digest in the request. Any other state fails closed.
+
+Promotion does not re-enter the Attempt's DSH Session. The terminal Decision already cancelled the Agent, drained its continuable descendants and owner-scoped Jobs, and installed a global `agent/pre-step` rejection for that Session, so claiming maintenance again would resume a sealed Session rather than fence anything. Promotion therefore reads only SQLite, the filesystem, and Git, and re-checks the live fingerprint and base checkout after its objects are written and before any ref exists. A process outside DSH ownership that edits the retained worktree during that window is detected by those checks; it is not prevented by them.
+
+A Git tree cannot carry the whole reviewed workspace. Forgeyard declares a total projection instead of implying otherwise: every reviewed manifest entry is classified as `promoted`, `git-admin`, `ignored`, `directory-implied`, or `directory-dropped`, the counts must sum to the manifest entry count, and the record's `notCarried` statement names every reviewed fact Git drops—ignored content, dropped and empty directories, the `.git` pointer, permission bits other than the executable bit, symlink modes, ownership, timestamps, and inode identity. A manifest entry Git's own view cannot explain, or a Git path the reviewed workspace does not hold, fails the promotion closed. **A promoted commit is therefore not a claim that the reviewed workspace was delivered in full; it is a claim about the declared projection, and the exclusion ledger is part of the record.**
+
+Correspondence is proven rather than assumed. Each promoted entry is read once under no-follow open and full before/after identity checks, computing both the SHA-256 the trusted manifest recorded and the Git object name for the same bytes; a read whose identity moved or whose SHA-256 differs from the manifest fails closed. The tree is built from that explicit path list in a scratch index under `GIT_INDEX_FILE` with `GIT_LITERAL_PATHSPECS`, never with `git add --all` and never with `-f`, and is accepted only when Git independently produced the identical object name and Git mode for every declared path in both the index and a re-read of the written tree.
+
+The output is one commit whose single parent is the Attempt's frozen base commit, authored and committed by a pinned `Forgeyard <forgeyard@promotion.invalid>` identity dated at the approval instant, under the ref `refs/forgeyard/promotions/<attemptId>` created with Git's own compare-and-swap requiring absence. Forgeyard refuses to write any other ref name. It never pushes, merges, opens a pull request, triggers CI, uploads an artifact, or deploys.
+
+The operator's checkout keeps its branch, HEAD, index, and working tree. The shared object database and the `refs/forgeyard/` namespace do gain content — that is the durable output. `refs/forgeyard/**` is outside `refs/heads`, `refs/tags`, and `refs/remotes`, so ordinary `git push`, `git push --all`, and `git fetch` do not carry it; `git push --mirror` and an explicit refspec still would. Treat a promoted ref as local, unsigned, unreviewed-by-anyone-else content until a human inspects it.
+
+At most one unfailed Promotion may exist per Attempt and per ref, enforced by SQLite partial unique indexes inside `BEGIN IMMEDIATE` before Git is touched. Promotion authority columns are hashed and immutable; only the settle-once `status`, `failure_reason`, and `settled_at` transition. An interrupted promotion reconciles against its ref at restart: absent means no durable output exists and the Attempt is released for an explicit retry; equal to the recorded commit settles it promoted; a different object is reported as a failure and never overwritten.
+
 ### Local persistence and recovery
 
-`forgeyard.sqlite` uses WAL, foreign keys, a busy timeout, synchronous writes, explicit transactions, and `BEGIN IMMEDIATE` for mutations. The containing directory is created mode `0700` and the database is set mode `0600` where the filesystem supports POSIX modes. Immutable-table triggers, terminal child-record sealing, exact Decision/state constraints, and atomic Retry linkage constrain accidental rewrites.
+`forgeyard.sqlite` uses WAL, foreign keys, a busy timeout, synchronous writes, explicit transactions, and `BEGIN IMMEDIATE` for mutations. The containing directory is created mode `0700` and the database is set mode `0600` where the filesystem supports POSIX modes. Immutable-table triggers, terminal child-record sealing, exact Decision/state constraints, atomic Retry linkage, and settle-once Promotion constraints constrain accidental rewrites. Promotion scratch index and pathspec files live in a mode-`0700` managed directory and are removed after each attempt.
 
-After a Host restart, Forgeyard marks uncertain non-terminal Attempts `needs_review` before installing live-Agent guards and rejects their later model steps. It does not infer success, resume a completed state, delete worktrees, or retry automatically. A terminal action bypasses Agent maintenance only when the public DSH Session lookup proves the opaque Session ID absent; attached or persisted Sessions are resumed and fenced.
+After a Host restart, Forgeyard marks uncertain non-terminal Attempts `needs_review` before installing live-Agent guards and rejects their later model steps, and reconciles every unsettled Promotion against its durable Git ref. It does not infer success, resume a completed state, delete worktrees, retry automatically, or promote automatically. A repository that is unreadable at boot leaves its Promotion `pending`, which the Cockpit reports as uncertain and which blocks another promotion of that Attempt until it reconciles. A terminal action bypasses Agent maintenance only when the public DSH Session lookup proves the opaque Session ID absent; attached or persisted Sessions are resumed and fenced.
 
 ## Known limitations
 
@@ -103,11 +119,15 @@ SQLite and DSH Session persistence are separate local stores. Mode bits are best
 
 Model/provider calls may transmit repository or Session content according to DSH provider configuration. Forgeyard does not add egress controls, redact prompts, or attest the provider. Verification commands and Git are also non-hermetic: their executable bytes, dynamically loaded libraries, clocks, and host services are not captured as a reproducible build environment.
 
-The Cockpit has no authentication or RBAC. Security relies on DSH Web's exposure and the host environment; do not bind it to an untrusted network.
+The Cockpit has no authentication or RBAC, and `promote` is reachable on the same unauthenticated local Remote surface as every other Forgeyard operation. Anything that can reach DSH Web can therefore create a Forgeyard promotion ref and objects in an already-authorized repository. It still cannot promote a state Forgeyard did not approve, cannot overwrite an existing ref, and cannot push. Security relies on DSH Web's exposure and the host environment; do not bind it to an untrusted network.
 
-### No delivery authority
+### Delivery authority stops at the local repository
 
-`APPROVE` authorizes only the exact reviewed state inside Forgeyard. Milestone 1 does not push, merge, open a pull request, upload artifacts, invoke CI, or deploy. There is no `APPROVE_DELIVERY` decision.
+`APPROVE` authorizes only the exact reviewed state inside Forgeyard. Promotion adds exactly one delivery step: a local commit and a `refs/forgeyard/promotions/` ref in the already-authorized repository. Forgeyard does not push, merge, open a pull request, upload artifacts, invoke CI, or deploy, and it has no remote credential of its own.
+
+A promoted commit is unsigned. Forgeyard disables commit signing so the commit name stays deterministic, so the pinned author identity is a Forgeyard label rather than an attestation. Anyone with write access to the repository can create, delete, or move a `refs/forgeyard/` ref outside Forgeyard; the SQLite record and the ref are two independent facts, and Forgeyard reports a disagreement rather than resolving it.
+
+Promoting does not review. A `PASS` still only means the recorded command exited successfully under the recorded conditions, and promotion carries that same limitation into a durable artifact. Inspect a promoted commit before merging it anywhere.
 
 ## Operational guidance
 
@@ -118,6 +138,9 @@ The Cockpit has no authentication or RBAC. Security relies on DSH Web's exposure
 - Keep DSH at the exact audited pin and run all compatibility, real-Git, and vertical-slice tests before an upgrade.
 - Inspect `needs_review` Attempts and quarantine directories manually. Do not delete an uncertain path merely because a database record looks terminal.
 - Treat any `INCOMPLETE` or truncated Evidence as non-approvable. Hashes and retained previews are diagnostic only and never waive completeness.
+- Read a promotion's exclusion ledger before relying on the promoted commit. Ignored build output, empty directories, and restrictive file permissions are deliberately not carried.
+- Inspect `refs/forgeyard/promotions/` with ordinary Git (`git log`, `git ls-tree -r`, `git diff <base>..<ref>`) and delete a promotion ref only after confirming what it is.
+- Never resolve a promotion reported as `failed` because a ref already exists by deleting that ref blindly.
 
 ## Reporting a security issue
 

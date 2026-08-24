@@ -9,6 +9,7 @@ import type {
   MissionCreateRequest,
   MissionId,
   MissionView,
+  PromoteRequest,
   RetryRequest,
   TaskId,
 } from '../types.ts'
@@ -21,6 +22,7 @@ export interface ForgeyardClientApi {
   verifyAttempt(attemptId: AttemptId): Promise<AttemptView>
   decide(request: DecisionRequest): Promise<AttemptView>
   retry(request: RetryRequest): Promise<AttemptView>
+  promote(request: PromoteRequest): Promise<AttemptView>
   attemptForSession(sessionId: string): Promise<AttemptSessionRef | null>
 }
 
@@ -181,6 +183,17 @@ export class ForgeyardCockpitController {
 
   async retry(request: RetryRequest): Promise<void> {
     await this.mutate('Starting retry', () => this.api.retry(request), (attempt, data) => {
+      return viewForAttempt(data, attempt.attempt.id)
+    })
+  }
+
+  /**
+   * Perform the explicitly confirmed local promotion of one approved Attempt.
+   * The request carries the exact review digest the operator confirmed, so a
+   * digest that moved between rendering and confirmation fails closed.
+   */
+  async promote(request: PromoteRequest): Promise<void> {
+    await this.mutate('Promoting approved deliverable', () => this.api.promote(request), (attempt, data) => {
       return viewForAttempt(data, attempt.attempt.id)
     })
   }

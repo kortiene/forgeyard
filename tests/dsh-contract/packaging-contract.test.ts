@@ -37,7 +37,9 @@ describe('out-of-tree static dual-face packaging', () => {
     expect(registration?.id).toBe('forgeyard')
     expect(registration?.factory).toBeTypeOf('function')
     const typert = await readFile(join(packageRoot, 'lib/typert.host.js'), 'utf8')
-    for (const method of ['snapshot', 'createMission', 'startAttempt', 'verifyAttempt', 'decide', 'retry', 'attemptForSession']) {
+    for (const method of [
+      'snapshot', 'createMission', 'startAttempt', 'verifyAttempt', 'decide', 'retry', 'promote', 'attemptForSession',
+    ]) {
       expect(typert).toContain(`id: 'forgeyard#forgeyard/${method}'`)
     }
   })
