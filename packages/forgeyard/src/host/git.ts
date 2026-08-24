@@ -222,15 +222,6 @@ export class GitAuthority {
     this.allowedRoots = Promise.all(config.allowedRepositoryRoots.map(async root => realpath(root)))
     this.managedRoot = this.prepareDirectory(config.worktreeRoot, false)
     this.hooksRoot = this.managedRoot.then(async root => this.prepareDirectory(join(root, '.empty-hooks'), true))
-    // These are eager readiness promises consumed lazily by the first Git call.
-    // Register passive rejection handlers so that, if the owning context is
-    // disposed before any caller awaits them (e.g. a short-lived instance whose
-    // managed root is removed during teardown), the deferred rejection does not
-    // surface as a process-level unhandledRejection. Real callers still await
-    // these exact promises and still observe the rejection.
-    this.allowedRoots.catch(() => {})
-    this.managedRoot.catch(() => {})
-    this.hooksRoot.catch(() => {})
   }
 
   private async assertPrivateDirectory(path: string, requireEmpty: boolean): Promise<string> {

@@ -1,4 +1,5 @@
-import { access, readFile, rm, writeFile } from 'node:fs/promises'
+import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { ExecutionSnapshot, MissionCreateRequest, ResolvedPolicySnapshot } from '../../packages/forgeyard/src/types.ts'
@@ -8,7 +9,7 @@ import type { PolicyOverrides, SessionGateway } from '../../packages/forgeyard/s
 import { GitAuthority } from '../../packages/forgeyard/src/host/git.ts'
 import { hashRecord, sha256 } from '../../packages/forgeyard/src/host/hash.ts'
 import { ForgeyardStore } from '../../packages/forgeyard/src/host/store.ts'
-import { makeCanonicalTempDir, run, seedRepository, testRuntime, type TestRuntime } from '../helpers/runtime.ts'
+import { run, seedRepository, testRuntime, type TestRuntime } from '../helpers/runtime.ts'
 
 const POLICY: ResolvedPolicySnapshot = {
   provider: 'deepseek-official',
@@ -83,7 +84,7 @@ describe('Milestone 1: one verified Attempt', () => {
   let engine: ForgeyardEngine
 
   beforeEach(async () => {
-    root = await makeCanonicalTempDir('forgeyard-vertical-')
+    root = await mkdtemp(join(tmpdir(), 'forgeyard-vertical-'))
     runtime = await testRuntime()
     repositoryPath = await seedRepository(runtime.runner, root)
     databasePath = join(root, 'state', 'forgeyard.sqlite')

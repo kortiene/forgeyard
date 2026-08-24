@@ -1,4 +1,5 @@
-import { chmod, lstat, mkdir, readFile, readdir, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, rename, rm, symlink, utimes, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
@@ -6,7 +7,7 @@ import {
   GitAuthority,
   isContained,
 } from '../../packages/forgeyard/src/host/git.ts'
-import { makeCanonicalTempDir, run, seedRepository, testRuntime, type TestRuntime } from '../helpers/runtime.ts'
+import { run, seedRepository, testRuntime, type TestRuntime } from '../helpers/runtime.ts'
 
 const ATTEMPT_1 = 'attempt_00000000-0000-4000-8000-000000000001'
 const ATTEMPT_2 = 'attempt_00000000-0000-4000-8000-000000000002'
@@ -18,7 +19,7 @@ describe('real Git isolation authority', () => {
   let git: GitAuthority
 
   beforeEach(async () => {
-    root = await makeCanonicalTempDir('forgeyard-real-git-')
+    root = await mkdtemp(join(tmpdir(), 'forgeyard-real-git-'))
     runtime = await testRuntime()
     repositoryPath = await seedRepository(runtime.runner, root)
     git = new GitAuthority(runtime.runner, {
@@ -70,7 +71,7 @@ describe('real Git isolation authority', () => {
   })
 
   it('fails closed for an outside allowlist, a dirty base, and a conflicting deterministic path', async () => {
-    const outsideRoot = await makeCanonicalTempDir('forgeyard-outside-git-')
+    const outsideRoot = await mkdtemp(join(tmpdir(), 'forgeyard-outside-git-'))
     try {
       const outsideRepository = await seedRepository(runtime.runner, outsideRoot)
       await expect(git.canonicalize(outsideRepository)).rejects.toThrow(/allowlist/u)
@@ -101,7 +102,7 @@ describe('real Git isolation authority', () => {
     const bucket = prepared.path.slice(0, prepared.path.lastIndexOf('/'))
     expect((await readdir(bucket)).some(name => name.startsWith(`${ATTEMPT_1}.quarantine-`))).toBe(true)
 
-    const outsideRoot = await makeCanonicalTempDir('forgeyard-symlink-target-')
+    const outsideRoot = await mkdtemp(join(tmpdir(), 'forgeyard-symlink-target-'))
     try {
       const outsideRepository = await seedRepository(runtime.runner, outsideRoot)
       const link = join(repositoryPath, 'outside-link')
