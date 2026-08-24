@@ -99,7 +99,11 @@ describe('Milestone 2: one promoted change', () => {
         argv, mode: 'workspace-write', enforcement: 'full', workspaceRoot: attempt.worktreePath,
       }),
     })
-    return new ForgeyardEngine(activeStore, git, sessions, collector, { dshVersion: '0.1.1-rc.2' })
+    return new ForgeyardEngine(activeStore, git, sessions, collector, {
+      dshVersion: '0.1.1-rc.2',
+      // Keep the bounded retry short enough for a test to observe it.
+      reconcileRetryMs: 250,
+    })
   }
 
   beforeEach(async () => {
@@ -741,6 +745,139 @@ describe('Milestone 2: one promoted change', () => {
     expect(released.promotion).toMatchObject({ status: 'eligible', eligible: true })
     const promoted = await promote(released)
     expect(promoted.promotions.map(item => item.status)).toEqual(['failed', 'promoted'])
+  })
+
+  it('refuses to write a promotion ref after its own lease lapsed', async () => {
+    const approved = await approvedAttempt()
+    // A stall Git's command timeout cannot bound — a stopped process, a frozen
+    // container — outlives the lease between the recorded intent and the write.
+    let wrote = 0
+    const create = engine.git.createPromotionRef.bind(engine.git)
+    engine.git.createPromotionRef = async (cwd, ref, commit) => {
+      wrote += 1
+      return create(cwd, ref, commit)
+    }
+    // Expire the lease the moment the row lands, exactly as an outlived lease
+    // would look to this Host when it finally resumes.
+    const insert = store.insertPendingPromotion.bind(store)
+    store.insertPendingPromotion = (record) => {
+      insert({ ...record, leaseExpiresAt: record.createdAt + 1 })
+    }
+
+    await expect(promote(approved)).rejects.toMatchObject<Partial<ForgeyardDomainError>>({ code: 'PROMOTION_BLOCKED' })
+    // No durable output may exist: the write is refused, not raced.
+    expect(wrote).toBe(0)
+    expect(await engine.git.readPromotionRef(repositoryPath, GitAuthority.promotionRef(approved.attempt.id))).toBeNull()
+    const record = store.promotions(approved.attempt.id)[0] as PromotionRecord
+    expect(record).toMatchObject({ status: 'failed' })
+    expect(record.failureReason).toMatch(/lost its lease before its Git ref was created/u)
+
+    // The Attempt is released and promotes for real once the lease is honest.
+    store.insertPendingPromotion = insert
+    const released = await engine.attemptView(approved.attempt.id)
+    expect(released.promotion).toMatchObject({ status: 'eligible', eligible: true })
+    expect((await promote(released)).promotion).toMatchObject({ status: 'promoted' })
+  })
+
+  it('never writes outside refs/forgeyard when a symbolic ref occupies the name', async () => {
+    const approved = await approvedAttempt()
+    const ref = GitAuthority.promotionRef(approved.attempt.id)
+    const branch = 'refs/heads/injected'
+    // A repository writer points the promotion name at a branch that does not
+    // exist. Git would follow the symref and create that branch instead.
+    await run(runtime.runner, repositoryPath, ['git', 'symbolic-ref', ref, branch])
+    expect(await gitText(repositoryPath, ['git', 'symbolic-ref', ref])).toBe(branch)
+
+    await expect(promote(approved)).rejects.toMatchObject<Partial<ForgeyardDomainError>>({ code: 'GIT_ERROR' })
+    // The guarantee is that promotion only ever writes under refs/forgeyard/.
+    const branches = await gitText(repositoryPath, ['git', 'for-each-ref', '--format=%(refname)', 'refs/heads/'])
+    expect(branches).not.toContain(branch)
+    expect((await run(runtime.runner, repositoryPath,
+      ['git', 'rev-parse', '--verify', '--quiet', branch], true)).exitCode).not.toBe(0)
+    expect(store.promotions(approved.attempt.id)[0]).toMatchObject({ status: 'failed' })
+  })
+
+  it('refuses a promoted ref whose commit object is no longer readable', async () => {
+    const approved = await approvedAttempt()
+    const promoted = await promote(approved)
+    const record = promoted.promotions[0] as PromotionRecord
+    expect(promoted.promotion).toMatchObject({ status: 'promoted' })
+
+    // The ref text survives object-store damage; `rev-parse --verify` answers
+    // from the ref alone and would keep calling the output durable.
+    const objectPath = join(
+      repositoryPath, '.git', 'objects',
+      record.outputCommit.slice(0, 2), record.outputCommit.slice(2),
+    )
+    await rm(objectPath, { force: true })
+    expect((await run(runtime.runner, repositoryPath,
+      ['git', 'rev-parse', '--verify', '--quiet', record.outputRef], true)).stdout.text.trim())
+      .toBe(record.outputCommit)
+
+    await expect(engine.git.readPromotionRef(repositoryPath, record.outputRef))
+      .rejects.toThrow(/that commit object is not readable/u)
+    const damaged = await engine.attemptView(approved.attempt.id)
+    expect(damaged.promotion.reason).toMatch(/could not be confirmed/u)
+    expect(damaged.promotion.reason).toMatch(/not readable in this repository/u)
+  })
+
+  it('surfaces an opposite settlement instead of reporting success over it', async () => {
+    const approved = await approvedAttempt()
+    const secondStore = new ForgeyardStore(databasePath)
+    try {
+      const create = engine.git.createPromotionRef.bind(engine.git)
+      // The ref write lands, but the call fails, and another Host settles the
+      // row `failed` in that window. The ref then reads back as this
+      // promotion's exact commit while the record says the opposite.
+      engine.git.createPromotionRef = async (cwd, ref, commit) => {
+        await create(cwd, ref, commit)
+        const pending = secondStore.pendingPromotions()[0] as PromotionRecord
+        secondStore.settlePromotion(pending.id, 'failed', 'Another Host read no ref and settled first.')
+        throw new Error('git update-ref timed out after 20000ms')
+      }
+      // Treating that as agreement would report a promoted Attempt over a
+      // durable output filed as a failure.
+      await expect(promote(approved)).rejects.toMatchObject<Partial<ForgeyardDomainError>>({ code: 'GIT_ERROR' })
+    } finally {
+      secondStore.close()
+    }
+
+    const record = store.promotions(approved.attempt.id)[0] as PromotionRecord
+    expect(record).toMatchObject({ status: 'failed' })
+    // The disagreement is reported rather than resolved: the ref exists, holds
+    // the promoted commit, and the record still says failed.
+    expect(await engine.git.readPromotionRef(repositoryPath, record.outputRef)).toBe(record.outputCommit)
+  })
+
+  it('re-arms reconciliation when a scheduled pass rejects', async () => {
+    const approved = await approvedAttempt()
+    const decision = approved.decisions[0] as DecisionRecord
+    const record = await pendingPromotion(approved.attempt, decision, approved.attempt.baseCommit)
+
+    // The first pass fails outright — SQLite write contention, say. It has
+    // already consumed the only timer, and nothing in the Cockpit can ask for
+    // another, so the pass must arm its own replacement on the way out.
+    let failures = 0
+    const settle = store.settlePromotion.bind(store)
+    store.settlePromotion = (id, status, reason) => {
+      if (failures === 0) {
+        failures += 1
+        throw new Error('database is locked')
+      }
+      return settle(id, status, reason)
+    }
+    await expect(engine.reconcilePromotions()).rejects.toThrow(/database is locked/u)
+    expect(failures).toBe(1)
+
+    // Nothing else will ask. The rejected pass has to have armed the retry that
+    // settles this row.
+    await vi.waitFor(
+      () => { expect(store.promotion(record.id)).toMatchObject({ status: 'failed' }) },
+      { timeout: 10_000, interval: 50 },
+    )
+    expect(store.promotion(record.id)?.failureReason)
+      .toMatch(/interrupted before this promotion created its Git ref/u)
+    store.settlePromotion = settle
   })
 
   it('never fails a promotion another Host may still be creating', async () => {

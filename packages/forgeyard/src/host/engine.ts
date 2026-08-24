@@ -100,6 +100,11 @@ function decisionRecord(request: DecisionRequest | RetryRequest, type: DecisionR
 
 export interface EngineConfig {
   dshVersion: string
+  /**
+   * How long to wait before retrying a Promotion whose lease has lapsed but
+   * which still could not be settled. Defaults to `PROMOTION_RECONCILE_RETRY_MS`.
+   */
+  reconcileRetryMs?: number
 }
 
 interface PlannedAttempt {
@@ -169,7 +174,9 @@ export class ForgeyardEngine {
     }
     if (earliest === null) return
     const remaining = earliest - Date.now()
-    const delay = remaining > 0 ? remaining + 1_000 : PROMOTION_RECONCILE_RETRY_MS
+    const delay = remaining > 0
+      ? remaining + 1_000
+      : this.config.reconcileRetryMs ?? PROMOTION_RECONCILE_RETRY_MS
     this.leaseTimer = setTimeout(() => {
       this.leaseTimer = null
       // A pass that cannot run right now leaves the row pending; the pass it
@@ -615,6 +622,31 @@ export class ForgeyardEngine {
       // outcome stays unknown, its lease is the only thing that can unblock the
       // Attempt — so the reconciliation that consumes it is armed immediately.
       this.scheduleLeaseReconciliation()
+      // Git's hard command timeout bounds time spent *inside* a Git call, not
+      // time this Host can lose to a stopped process, a container freeze, or a
+      // long garbage collection between the recorded intent and this write. A
+      // stall that outlived the lease would let another Host settle this row and
+      // release the constraint while this one still went on to create a durable
+      // ref recorded as failed. Ownership is therefore re-read immediately
+      // before the write, which is the last instant Forgeyard controls.
+      const owned = this.store.promotion(planned.record.id)
+      if (owned === undefined || owned.status !== 'pending') {
+        throw new ForgeyardDomainError(
+          'PROMOTION_BLOCKED',
+          `This promotion was settled as ${owned?.status ?? 'missing'} elsewhere before its Git ref was created; no durable output was written.`,
+        )
+      }
+      if (owned.leaseExpiresAt <= Date.now()) {
+        this.failPromotion(
+          planned.record.id,
+          'This promotion lost its lease before its Git ref was created, so Forgeyard refused to write it',
+          new Error('the promotion lease lapsed before the ref write'),
+        )
+        throw new ForgeyardDomainError(
+          'PROMOTION_BLOCKED',
+          'This promotion lost its lease before its Git ref was created. No durable output was written, so the Attempt may be promoted again.',
+        )
+      }
       try {
         await this.git.createPromotionRef(prepared.repository.path, planned.record.outputRef, planned.record.outputCommit)
       } catch (error) {
@@ -640,12 +672,10 @@ export class ForgeyardEngine {
           error,
         )
       }
-      // The lease makes a concurrent settlement unreachable for a live Host, but
-      // a settlement this Host did not perform is never overwritten. The ref read
+      // A settlement this Host did not perform is never overwritten. The ref read
       // back as this promotion's exact commit, so an existing `promoted` record
-      // is the same outcome and stands.
-      this.settleReconciled(planned.record.id, 'promoted', null)
-      if (this.store.promotion(planned.record.id)?.status !== 'promoted') {
+      // is the same outcome and stands; an opposite one is a disagreement.
+      if (this.settleReconciled(planned.record.id, 'promoted', null) === 'conflicted') {
         throw new ForgeyardDomainError(
           'PROMOTION_BLOCKED',
           `${planned.record.outputRef} holds this promotion's commit ${planned.record.outputCommit}, but the Promotion was settled as failed elsewhere; inspect the ref before promoting again.`,
@@ -695,7 +725,12 @@ export class ForgeyardEngine {
       ))
     }
     if (observed === record.outputCommit) {
-      this.settleReconciled(record.id, 'promoted', null)
+      if (this.settleReconciled(record.id, 'promoted', null) === 'conflicted') {
+        throw new ForgeyardDomainError('GIT_ERROR', boundedReason(
+          `${prefix}, but ${record.outputRef} holds this promotion's commit ${record.outputCommit} while the Promotion was settled as failed elsewhere; inspect the ref before promoting again`,
+          cause,
+        ))
+      }
       return this.attemptViewUnqueued(attempt.id)
     }
     const reason = observed === null
@@ -706,22 +741,32 @@ export class ForgeyardEngine {
   }
 
   /**
-   * Settle a Promotion, accepting a settlement another Host wrote first.
+   * Settle a Promotion, accepting a settlement another Host already wrote.
    *
-   * Two Hosts can read the same expired pending row and the same ref before
-   * either settles it. A Promotion settles exactly once, by whoever gets there
-   * first; the loser must report that authoritative outcome rather than fail,
-   * which would abort a boot reconciliation or a `promote` request over a
-   * question that is already answered. Returns whether this Host settled it.
+   * Two Hosts can read the same expired pending row before either settles it. A
+   * Promotion settles exactly once, by whoever gets there first; the loser must
+   * report that outcome rather than fail, which would abort a boot
+   * reconciliation or a `promote` request over a question already answered.
+   *
+   * An *opposite* settlement is not the same thing and is never accepted as
+   * agreement. Two Hosts can legitimately observe different refs — one reads
+   * nothing and settles `failed`, an external writer creates the ref, the other
+   * reads the exact promoted commit — and quietly keeping `failed` would leave
+   * a durable output filed as a failure. That disagreement is surfaced.
    */
-  private settleReconciled(id: PromotionId, status: 'promoted' | 'failed', failureReason: string | null): boolean {
+  private settleReconciled(
+    id: PromotionId,
+    status: 'promoted' | 'failed',
+    failureReason: string | null,
+  ): 'settled' | 'agreed' | 'conflicted' {
     try {
       this.store.settlePromotion(id, status, failureReason)
-      return true
+      return 'settled'
     } catch (error) {
+      const current = this.store.promotion(id)?.status
       // Only a row that is still pending means this was a real write failure.
-      if (this.store.promotion(id)?.status === 'pending') throw error
-      return false
+      if (current === undefined || current === 'pending') throw error
+      return current === status ? 'agreed' : 'conflicted'
     }
   }
 
@@ -876,6 +921,17 @@ export class ForgeyardEngine {
   }
 
   private async reconcilePromotionsUnqueued(attemptId: AttemptId | null): Promise<number> {
+    try {
+      return await this.reconcilePending(attemptId)
+    } finally {
+      // Armed on every exit path. A pass that rejects — SQLite write contention
+      // with another Host, say — has already consumed the only timer, and the
+      // Cockpit exposes no action that could ask for another.
+      this.scheduleLeaseReconciliation()
+    }
+  }
+
+  private async reconcilePending(attemptId: AttemptId | null): Promise<number> {
     const now = Date.now()
     const pending = this.store.pendingPromotions()
       .filter(record => attemptId === null || record.attemptId === attemptId)
@@ -921,11 +977,8 @@ export class ForgeyardEngine {
             'failed',
             `${promotion.outputRef} already resolves to ${observed} instead of this promotion's commit ${promotion.outputCommit}. Inspect the ref before promoting again.`,
           )
-      if (wrote) settled += 1
+      if (wrote === 'settled') settled += 1
     }
-    // Anything still pending is either leased or unsettleable right now. Either
-    // way the next pass is armed here rather than waiting for a Host restart.
-    this.scheduleLeaseReconciliation()
     return settled
   }
 
@@ -975,7 +1028,7 @@ export class ForgeyardEngine {
         return {
           ...base,
           status: 'promoted',
-          reason: `This Attempt was already promoted to ${active.outputRef} at ${active.outputCommit}. The ref could not be read to confirm it right now: ${errorText(error)}`,
+          reason: `This Attempt was already promoted to ${active.outputRef} at ${active.outputCommit}. That could not be confirmed: ${errorText(error)}`,
         }
       }
       if (observed !== active.outputCommit) {

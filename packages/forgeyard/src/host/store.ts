@@ -301,6 +301,12 @@ export class ForgeyardStore {
       // what has actually been applied is re-read inside the lock.
       this.immediate(() => {
         const applied = this.schemaVersion()
+        // A newer Host may have migrated past this one entirely while it waited
+        // for the lock. Skipping would let this Host run against a schema it
+        // does not support, so the startup rejection is repeated in the lock.
+        if (applied > supported) {
+          throw new Error(`forgeyard.sqlite schema ${applied} is newer than this Host supports`)
+        }
         if (migration.version <= applied) return
         if (applied > 0 && this.migrationApplied(migration.version)) {
           // Another Host applied and recorded it; only the version lags behind.

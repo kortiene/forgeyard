@@ -1164,6 +1164,17 @@ export class GitAuthority {
     if (result.exitCode !== 0) throw new Error(`git rev-parse failed for ${ref}: ${result.stderr.text.trim()}`)
     const oid = cleanLine(result.stdout.text)
     if (!/^[0-9a-f]{40,64}$/u.test(oid)) throw new Error(`Git returned an invalid object name for ${ref}`)
+    // `rev-parse --verify` answers from the ref's text alone: a ref left behind
+    // by a damaged or pruned object database still reports its recorded object
+    // name. A promoted output nothing can read is not a durable output, so the
+    // object is proven to exist and to be a commit before the ref is believed.
+    const object = await this.invoke(cwd, ['cat-file', '-e', `${oid}^{commit}`])
+    if (object.spawnError !== null || !object.stderr.complete) {
+      throw new Error('the Forgeyard promotion commit could not be inspected completely')
+    }
+    if (object.exitCode !== 0) {
+      throw new Error(`${ref} names ${oid}, but that commit object is not readable in this repository`)
+    }
     return oid
   }
 
@@ -1172,11 +1183,28 @@ export class GitAuthority {
    * empty expected value means "must not exist", so a colliding ref (another
    * Forgeyard process, or an operator-created name) loses atomically inside
    * Git's ref transaction instead of being silently overwritten.
+   *
+   * `--no-deref` makes that compare-and-swap apply to this ref name itself. Git
+   * otherwise follows a symbolic ref, so a `refs/forgeyard/promotions/<attempt>`
+   * pre-created as a symref to `refs/heads/<anything>` would satisfy the
+   * must-not-exist check at its *target* and make Forgeyard create that branch —
+   * a write outside `refs/forgeyard/`, which Forgeyard guarantees it never does.
+   * `--no-deref` alone is not enough: a symref whose target does not exist has
+   * no object value, so the must-not-exist check passes and Git silently
+   * replaces the symref. A promotion name that is already symbolic is therefore
+   * rejected outright, because Forgeyard never overwrites a ref it did not create.
    */
   async createPromotionRef(cwd: string, ref: string, commit: string): Promise<void> {
     this.assertPromotionRef(ref)
     if (!/^[0-9a-f]{40,64}$/u.test(commit)) throw new Error('invalid promotion commit object name')
-    const result = await this.invoke(cwd, ['update-ref', '--create-reflog', '--end-of-options', ref, commit, ''])
+    const symbolic = await this.invoke(cwd, ['symbolic-ref', '--quiet', '--', ref])
+    if (symbolic.spawnError !== null || !symbolic.stdout.complete) {
+      throw new Error('the Forgeyard promotion ref could not be inspected for a symbolic ref')
+    }
+    if (symbolic.exitCode === 0) {
+      throw new Error(`${ref} is a symbolic ref to ${cleanLine(symbolic.stdout.text)}; Forgeyard will not write through it`)
+    }
+    const result = await this.invoke(cwd, ['update-ref', '--no-deref', '--create-reflog', '--end-of-options', ref, commit, ''])
     if (result.spawnError !== null || result.exitCode !== 0) {
       const detail = result.spawnError ?? (result.stderr.text.trim() || `exit ${String(result.exitCode)}`)
       throw new Error(`the Forgeyard promotion ref could not be created: ${detail}`)

@@ -169,11 +169,34 @@ its own exclusively created scratch directory: the tree is written before any ro
 claims the uniqueness constraint, so nothing else keeps two concurrent calls on
 one Attempt from deleting each other's index and pathspec files.
 
+The lease is a bound, not a fence. Git's command timeout bounds time spent
+*inside* a Git call; it cannot bound a stopped process, a frozen container, or a
+long garbage collection between the recorded intent and the write. Forgeyard
+therefore re-reads its own ownership immediately before creating the ref and
+refuses to write once the lease has lapsed, which is the last instant it
+controls. A stall between that check and Git's own ref transaction remains
+theoretically possible: the residual outcome is one durable ref recorded as
+`failed`, which the deterministic commit makes self-correcting — the next
+promotion computes the same commit, finds the ref already holding it, and records
+it truthfully. Two Hosts that settle one Promotion in opposite directions are
+reported as a disagreement rather than quietly reconciled.
+
+Promotion refs are written with `--no-deref`, and a promotion name that is
+already a symbolic ref is rejected outright. Git otherwise follows a symref, and
+a `refs/forgeyard/promotions/<attempt>` pointed at `refs/heads/<anything>` would
+make Forgeyard create that branch — a write outside `refs/forgeyard/`. `--no-deref`
+alone is not enough, because a symref whose target does not exist has no object
+value and Git silently replaces it. A ref is also not believed on its text alone:
+the commit object it names is proven to exist and to be a commit, so a pruned or
+damaged object database is reported instead of advertised as a durable output.
+
 Migration 003 is the first migration that can meet a database another Host is
 already upgrading. The runner therefore re-reads what has actually been applied
 *inside* its `BEGIN IMMEDIATE` transaction, so a Host whose startup version read
 lost the race skips the migration the winner committed rather than re-executing
-`CREATE TABLE` and failing its own initialization.
+`CREATE TABLE` and failing its own initialization. That in-lock read also repeats
+the startup rejection: a Host that finds the shared database migrated past what
+it supports refuses to initialize rather than running against a newer schema.
 
 ## Alternatives rejected
 

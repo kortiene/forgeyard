@@ -101,6 +101,11 @@ Git itself refuses).
 | Situation | Result |
 | --- | --- |
 | the ref already exists | `GIT_ERROR`; a `failed` Promotion is recorded and the existing ref is untouched |
+| the promotion name is already a symbolic ref | refused before Git is asked to write; the symref is untouched and no branch is created |
+| the promoted commit object is pruned or damaged | the ref is not believed on its text alone; the Promotion is reported as unconfirmed rather than durable |
+| this Host stalls past its own lease before writing the ref | the write is refused, no durable output exists, and the Attempt may be promoted again |
+| two Hosts settle one Promotion in opposite directions | reported as a disagreement; success is never claimed over a record settled the other way |
+| a newer Host migrated the shared database past this one | this Host refuses to initialize rather than run against an unsupported schema |
 | Git commits the ref but the call fails (a timeout, a lost subprocess result) | the ref is read back, names this promotion's commit, and the Promotion settles `promoted`; the durable output stands and is never filed as a failure |
 | the ref write fails and the ref cannot be read either | nothing is guessed: the Promotion stays `pending` and `uncertain`, and its lease hands the outcome to reconciliation |
 | two Hosts reconcile the same expired Promotion at once | it settles exactly once; the loser reports the authoritative outcome instead of failing its reconciliation or its `promote` request |
