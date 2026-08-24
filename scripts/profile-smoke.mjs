@@ -1,6 +1,6 @@
 import { once } from 'node:events'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -11,8 +11,11 @@ import { promisify } from 'node:util'
 const root = dirname(dirname(fileURLToPath(import.meta.url)))
 const dsh = join(root, 'node_modules', '.bin', process.platform === 'win32' ? 'dsh.cmd' : 'dsh')
 const profile = join(root, 'profiles', 'local')
-const dshHome = await mkdtemp(join(tmpdir(), 'forgeyard-dsh-profile-'))
-const repositoryRoot = await mkdtemp(join(tmpdir(), 'forgeyard-dsh-repositories-'))
+// Forgeyard requires canonical managed roots (it realpaths repository roots and
+// rejects a worktree root that traverses a symlink). macOS resolves its
+// temporary base under /var -> /private/var, so canonicalize both temp roots.
+const dshHome = await realpath(await mkdtemp(join(tmpdir(), 'forgeyard-dsh-profile-')))
+const repositoryRoot = await realpath(await mkdtemp(join(tmpdir(), 'forgeyard-dsh-repositories-')))
 const repository = join(repositoryRoot, 'mission-repository')
 const execFileAsync = promisify(execFile)
 let child
