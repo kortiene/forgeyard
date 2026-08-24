@@ -546,6 +546,78 @@ describe('Milestone 2: one promoted change', () => {
     expect(promoted.promotions.map(item => item.status)).toEqual(['failed', 'promoted'])
   })
 
+  it('records a promotion whose ref write landed but whose Git call failed', async () => {
+    const approved = await approvedAttempt()
+    const create = engine.git.createPromotionRef.bind(engine.git)
+    let calls = 0
+    // `git update-ref` can commit its ref transaction and still fail the call
+    // that ran it — a timeout, or a lost subprocess result, after the ref
+    // landed. The durable output exists; the error says nothing about it.
+    engine.git.createPromotionRef = async (cwd, ref, commit) => {
+      calls += 1
+      await create(cwd, ref, commit)
+      throw new Error('git update-ref timed out after 20000ms')
+    }
+
+    const promoted = await promote(approved)
+    expect(calls).toBe(1)
+    const record = promoted.promotions[0] as PromotionRecord
+    // Recording `failed` here would file an existing output as a failure and
+    // release the constraint onto a ref every later retry would collide with.
+    expect(record).toMatchObject({ status: 'promoted', failureReason: null })
+    expect(await create.call(engine.git, repositoryPath, record.outputRef, record.outputCommit)
+      .then(() => 'created', () => 'refused')).toBe('refused')
+    expect(await engine.git.readPromotionRef(repositoryPath, record.outputRef)).toBe(record.outputCommit)
+    expect(promoted.promotion).toMatchObject({ status: 'promoted', outputCommit: record.outputCommit })
+  })
+
+  it('leaves a promotion pending when neither the ref write nor its read-back is conclusive', async () => {
+    const approved = await approvedAttempt()
+    const read = engine.git.readPromotionRef.bind(engine.git)
+    engine.git.createPromotionRef = async () => { throw new Error('git update-ref timed out after 20000ms') }
+    engine.git.readPromotionRef = async () => { throw new Error('the Forgeyard promotion ref could not be read completely') }
+
+    await expect(promote(approved)).rejects.toMatchObject<Partial<ForgeyardDomainError>>({ code: 'GIT_ERROR' })
+    engine.git.readPromotionRef = read
+
+    // Nothing is guessed in either direction: the Promotion stays pending and
+    // its lease hands the question to reconciliation.
+    const record = store.promotions(approved.attempt.id)[0] as PromotionRecord
+    expect(record).toMatchObject({ status: 'pending', failureReason: null })
+    const view = await engine.attemptView(approved.attempt.id)
+    expect(view.promotion).toMatchObject({ status: 'uncertain', eligible: false })
+    expect(view.promotion.reason).toMatch(/holds a live lease/u)
+  })
+
+  it('accepts a settlement another Host wrote while reconciling the same Promotion', async () => {
+    const approved = await approvedAttempt()
+    const decision = approved.decisions[0] as DecisionRecord
+    const record = await pendingPromotion(approved.attempt, decision, approved.attempt.baseCommit)
+    await engine.git.createPromotionRef(repositoryPath, record.outputRef, record.outputCommit)
+
+    const secondStore = new ForgeyardStore(databasePath)
+    try {
+      const secondEngine = buildEngine(secondStore)
+      const read = secondEngine.git.readPromotionRef.bind(secondEngine.git)
+      // Both Hosts read the same expired pending row and the same ref before
+      // either settles it. This one loses the write.
+      secondEngine.git.readPromotionRef = async (cwd, ref) => {
+        const observed = await read(cwd, ref)
+        store.settlePromotion(record.id, 'promoted', null)
+        return observed
+      }
+      // The loser reports the authoritative outcome instead of aborting the
+      // whole reconciliation over a question that is already answered.
+      await expect(secondEngine.reconcilePromotions()).resolves.toBe(0)
+    } finally {
+      secondStore.close()
+    }
+    expect(store.promotion(record.id)).toMatchObject({ status: 'promoted', failureReason: null })
+    expect(await engine.attemptView(approved.attempt.id)).toMatchObject({
+      promotion: { status: 'promoted', outputCommit: record.outputCommit },
+    })
+  })
+
   it('never fails a promotion another Host may still be creating', async () => {
     const approved = await approvedAttempt()
     const decision = approved.decisions[0] as DecisionRecord

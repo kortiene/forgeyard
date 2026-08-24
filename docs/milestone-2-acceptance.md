@@ -101,6 +101,10 @@ Git itself refuses).
 | Situation | Result |
 | --- | --- |
 | the ref already exists | `GIT_ERROR`; a `failed` Promotion is recorded and the existing ref is untouched |
+| Git commits the ref but the call fails (a timeout, a lost subprocess result) | the ref is read back, names this promotion's commit, and the Promotion settles `promoted`; the durable output stands and is never filed as a failure |
+| the ref write fails and the ref cannot be read either | nothing is guessed: the Promotion stays `pending` and `uncertain`, and its lease hands the outcome to reconciliation |
+| two Hosts reconcile the same expired Promotion at once | it settles exactly once; the loser reports the authoritative outcome instead of failing its reconciliation or its `promote` request |
+| two Hosts open a shared database needing migration 003 | the migration runner re-reads what is applied inside its write transaction, so the loser skips it instead of failing startup |
 | a concurrent promotion of the same Attempt | one succeeds; the other is `PROMOTION_BLOCKED` by the SQLite partial unique index before Git is touched |
 | a repeated promotion of a completed one | `PROMOTION_BLOCKED` with a stable message naming the existing ref and commit |
 | interrupted before the ref existed | once its lease expires the Promotion reconciles to `failed` ("no durable output exists") and the Attempt may be promoted again |

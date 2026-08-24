@@ -17,6 +17,7 @@ import type {
   MissionView,
   PromoteRequest,
   PromotionEligibility,
+  PromotionId,
   PromotionRecord,
   ReviewState,
   RetryRequest,
@@ -560,8 +561,15 @@ export class ForgeyardEngine {
       try {
         await this.git.createPromotionRef(prepared.repository.path, planned.record.outputRef, planned.record.outputCommit)
       } catch (error) {
-        this.failPromotion(planned.record.id, 'The Forgeyard promotion ref was not created', error)
-        throw new ForgeyardDomainError('GIT_ERROR', boundedReason('The Forgeyard promotion ref was not created', error))
+        // Git can commit its ref transaction and still fail the call that ran
+        // it — a timeout or a lost subprocess result after the ref landed. The
+        // error alone therefore proves nothing about whether a durable output
+        // exists, and recording `failed` here would file an existing output as
+        // a failure and release the uniqueness constraint onto a ref nothing
+        // knows about. Only the ref itself can settle this.
+        return await this.settleUncertainRefWrite(
+          attempt, prepared, planned.record, 'The Forgeyard promotion ref was not created', error,
+        )
       }
       try {
         const written = await this.git.readPromotionRef(prepared.repository.path, planned.record.outputRef)
@@ -569,26 +577,22 @@ export class ForgeyardEngine {
           throw new Error(`the ref resolves to ${written ?? 'nothing'} instead of the promoted commit`)
         }
       } catch (error) {
-        this.failPromotion(
-          planned.record.id,
+        return await this.settleUncertainRefWrite(
+          attempt, prepared, planned.record,
           'The Forgeyard promotion ref did not read back as the promoted commit; inspect it manually',
           error,
         )
-        throw new ForgeyardDomainError('GIT_ERROR', boundedReason('The Forgeyard promotion ref did not read back', error))
       }
-      try {
-        this.store.settlePromotion(planned.record.id, 'promoted', null)
-      } catch (error) {
-        // The lease makes this unreachable for a live Host, but a settlement
-        // this Host did not perform must never be overwritten or guessed at.
-        // The ref already read back as this promotion's exact commit, so report
-        // the recorded outcome rather than inventing a second one.
-        if (this.store.promotion(planned.record.id)?.status !== 'promoted') {
-          throw new ForgeyardDomainError(
-            'PROMOTION_BLOCKED',
-            boundedReason('The Forgeyard promotion ref exists but its Promotion could not be settled as promoted', error),
-          )
-        }
+      // The lease makes a concurrent settlement unreachable for a live Host, but
+      // a settlement this Host did not perform is never overwritten. The ref read
+      // back as this promotion's exact commit, so an existing `promoted` record
+      // is the same outcome and stands.
+      this.settleReconciled(planned.record.id, 'promoted', null)
+      if (this.store.promotion(planned.record.id)?.status !== 'promoted') {
+        throw new ForgeyardDomainError(
+          'PROMOTION_BLOCKED',
+          `${planned.record.outputRef} holds this promotion's commit ${planned.record.outputCommit}, but the Promotion was settled as failed elsewhere; inspect the ref before promoting again.`,
+        )
       }
       return this.attemptViewUnqueued(attempt.id)
     })
@@ -605,6 +609,63 @@ export class ForgeyardEngine {
    */
   private promotionLeaseMs(): number {
     return 2 * this.git.config.commandTimeoutMs + PROMOTION_LEASE_MARGIN_MS
+  }
+
+  /**
+   * Resolve a promotion whose ref write left the durable outcome unknown.
+   *
+   * The ref is the only authority: it either names this promotion's exact
+   * deterministic commit — in which case the write landed and the approved
+   * deliverable is durable — or it is absent, or it holds something Forgeyard
+   * must never overwrite. When even reading it fails, the Promotion stays
+   * `pending` and its lease hands the question to reconciliation instead of
+   * guessing an answer in either direction.
+   */
+  private async settleUncertainRefWrite(
+    attempt: AttemptRecord,
+    prepared: PreparedWorktree,
+    record: PromotionRecord,
+    prefix: string,
+    cause: unknown,
+  ): Promise<AttemptView> {
+    let observed: string | null
+    try {
+      observed = await this.git.readPromotionRef(prepared.repository.path, record.outputRef)
+    } catch {
+      throw new ForgeyardDomainError('GIT_ERROR', boundedReason(
+        `${prefix}, and the ref could not be read back. This Promotion stays uncertain until Forgeyard reconciles it against the ref`,
+        cause,
+      ))
+    }
+    if (observed === record.outputCommit) {
+      this.settleReconciled(record.id, 'promoted', null)
+      return this.attemptViewUnqueued(attempt.id)
+    }
+    const reason = observed === null
+      ? prefix
+      : `${prefix}: ${record.outputRef} resolves to ${observed} instead of this promotion's commit ${record.outputCommit}`
+    this.failPromotion(record.id, reason, cause)
+    throw new ForgeyardDomainError('GIT_ERROR', boundedReason(reason, cause))
+  }
+
+  /**
+   * Settle a Promotion, accepting a settlement another Host wrote first.
+   *
+   * Two Hosts can read the same expired pending row and the same ref before
+   * either settles it. A Promotion settles exactly once, by whoever gets there
+   * first; the loser must report that authoritative outcome rather than fail,
+   * which would abort a boot reconciliation or a `promote` request over a
+   * question that is already answered. Returns whether this Host settled it.
+   */
+  private settleReconciled(id: PromotionId, status: 'promoted' | 'failed', failureReason: string | null): boolean {
+    try {
+      this.store.settlePromotion(id, status, failureReason)
+      return true
+    } catch (error) {
+      // Only a row that is still pending means this was a real write failure.
+      if (this.store.promotion(id)?.status === 'pending') throw error
+      return false
+    }
   }
 
   /**
@@ -790,22 +851,20 @@ export class ForgeyardEngine {
         // and the Cockpit reports it as uncertain rather than guessing.
         continue
       }
-      if (observed === promotion.outputCommit) {
-        this.store.settlePromotion(promotion.id, 'promoted', null)
-      } else if (observed === null) {
-        this.store.settlePromotion(
-          promotion.id,
-          'failed',
-          'Forgeyard was interrupted before this promotion created its Git ref. No durable output exists, so the Attempt may be promoted again.',
-        )
-      } else {
-        this.store.settlePromotion(
-          promotion.id,
-          'failed',
-          `${promotion.outputRef} already resolves to ${observed} instead of this promotion's commit ${promotion.outputCommit}. Inspect the ref before promoting again.`,
-        )
-      }
-      settled += 1
+      const wrote = observed === promotion.outputCommit
+        ? this.settleReconciled(promotion.id, 'promoted', null)
+        : observed === null
+          ? this.settleReconciled(
+            promotion.id,
+            'failed',
+            'Forgeyard was interrupted before this promotion created its Git ref. No durable output exists, so the Attempt may be promoted again.',
+          )
+          : this.settleReconciled(
+            promotion.id,
+            'failed',
+            `${promotion.outputRef} already resolves to ${observed} instead of this promotion's commit ${promotion.outputCommit}. Inspect the ref before promoting again.`,
+          )
+      if (wrote) settled += 1
     }
     return settled
   }

@@ -93,6 +93,34 @@ describe('Forgeyard SQLite authority migration and retry transaction', () => {
     }
   })
 
+  it('skips a migration another Host committed while this one was starting', async () => {
+    const path = await databasePath('concurrent-migration')
+    const first = new ForgeyardStore(path)
+    first.close()
+
+    // Reproduce the loser's exact durable state in a shared database: the
+    // winning Host applied and recorded 003 inside its write transaction, and
+    // this Host read `user_version` before that commit landed. Re-executing the
+    // migration on that stale read would fail this Host's whole startup.
+    const raw = new DatabaseSync(path)
+    raw.exec('PRAGMA user_version=2')
+    raw.close()
+
+    const second = new ForgeyardStore(path)
+    try {
+      expect((second.database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(3)
+      // Applied exactly once, by the Host that won the write transaction.
+      expect(second.database.prepare('SELECT version,name FROM schema_migrations ORDER BY version').all())
+        .toEqual([
+          { version: 1, name: '001_initial' },
+          { version: 2, name: '002_authority_hardening' },
+          { version: 3, name: '003_local_promotion' },
+        ])
+    } finally {
+      second.close()
+    }
+  })
+
   it('keeps the Host migration mirror semantically identical to the checked-in SQL', async () => {
     // The Host bundles its migrations as source strings for single-file
     // packaging, so the checked-in .sql files could silently drift from what a

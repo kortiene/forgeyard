@@ -289,18 +289,42 @@ export class ForgeyardStore {
     this.database = new DatabaseSync(path)
     try { chmodSync(path, 0o600) } catch { /* Filesystems may not expose POSIX modes. */ }
     this.database.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA synchronous=FULL;')
-    const version = Number((this.database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version)
+    const version = this.schemaVersion()
     const supported = MIGRATIONS.at(-1)?.version ?? 0
     if (version > supported) throw new Error(`forgeyard.sqlite schema ${version} is newer than this Host supports`)
     for (const migration of MIGRATIONS) {
       if (migration.version <= version) continue
+      // Several Hosts may open one database. Another can commit this exact
+      // migration between the version read above and this write transaction,
+      // which would leave a stale reader executing `CREATE TABLE` a second time
+      // and failing its own startup. `BEGIN IMMEDIATE` serializes the two, so
+      // what has actually been applied is re-read inside the lock.
       this.immediate(() => {
+        const applied = this.schemaVersion()
+        if (migration.version <= applied) return
+        if (applied > 0 && this.migrationApplied(migration.version)) {
+          // Another Host applied and recorded it; only the version lags behind.
+          this.database.exec(`PRAGMA user_version=${migration.version}`)
+          return
+        }
         this.database.exec(migration.sql)
         this.database.prepare('INSERT INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)')
           .run(migration.version, migration.name, Date.now())
         this.database.exec(`PRAGMA user_version=${migration.version}`)
       })
     }
+  }
+
+  private schemaVersion(): number {
+    return Number((this.database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version)
+  }
+
+  /**
+   * Whether this migration is already recorded as applied. Only meaningful once
+   * migration 001 has created `schema_migrations`, so callers check the version.
+   */
+  private migrationApplied(version: number): boolean {
+    return this.database.prepare('SELECT 1 FROM schema_migrations WHERE version=?').get(version) !== undefined
   }
 
   close(): void {

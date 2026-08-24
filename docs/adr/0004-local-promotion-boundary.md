@@ -142,6 +142,22 @@ while a live Host is still in flight, and it caps how long an abandoned intent
 blocks its Attempt after a Host dies. A leased Promotion is reported as
 `uncertain` and reconciled by the next Host that looks after the lease lapses.
 
+A ref write that *fails* is equally uninformative: Git can commit its ref
+transaction and still fail the call that ran it, so the error alone never decides
+whether a durable output exists. Forgeyard reads the ref back and settles only
+what the ref proves — this promotion's exact deterministic commit settles
+`promoted`, absence settles `failed`, and any other object settles `failed`
+naming both. If reading the ref fails too, nothing is guessed in either
+direction: the Promotion stays `pending` and its lease hands the question to
+reconciliation. A Promotion settles exactly once, by whichever Host gets there
+first; the loser reports that authoritative outcome instead of failing.
+
+Migration 003 is the first migration that can meet a database another Host is
+already upgrading. The runner therefore re-reads what has actually been applied
+*inside* its `BEGIN IMMEDIATE` transaction, so a Host whose startup version read
+lost the race skips the migration the winner committed rather than re-executing
+`CREATE TABLE` and failing its own initialization.
+
 ## Alternatives rejected
 
 - **A `PROMOTE` Decision type.** Requires editing accepted migrations, conflates
