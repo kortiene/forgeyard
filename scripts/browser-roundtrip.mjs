@@ -51,15 +51,25 @@ async function main() {
     await execFileAsync('git', ['add', '--', 'answer.txt', 'verify.mjs'], { cwd: repository })
     await execFileAsync('git', ['commit', '-m', 'browser base'], { cwd: repository })
 
-    // Real operator provider config (startAttempt selects a live model/session).
+    // Real operator provider credential (startAttempt selects a live model/session).
+    // Only the credential is required. Null Mission overrides resolve through the
+    // pinned profile's own defaults, so no operator `agent-default-model` block is
+    // needed; FORGEYARD_ACCEPT_* forces a specific route when the profile default
+    // is not usable for this operator (same overrides as the native harness).
     const home = await prepareOperatorDshHome(workspace.base)
-    if (!home.hasProvider) {
+    if (!home.hasCredentials) {
       throw new Error(
-        'MISSING CAPABILITY: no operator DSH provider configuration was found (need '
-        + `${home.source}/.credentials.yaml and an agent-default-model). Cannot create a native Session for the round trip.`,
+        `MISSING CAPABILITY: no operator DSH provider credential was found at ${home.source}/.credentials.yaml. `
+        + 'Cannot create a native Session for the round trip. Configure a provider through DSH first.',
       )
     }
-    step(`operator provider configured: ${home.defaultModel.provider}/${home.defaultModel.model}`)
+    const provider = process.env.FORGEYARD_ACCEPT_PROVIDER ?? null
+    const model = process.env.FORGEYARD_ACCEPT_MODEL ?? null
+    const reasoningEffort = process.env.FORGEYARD_ACCEPT_REASONING ?? null
+    step(
+      `operator provider credential available (${home.copied.join(', ') || 'none'}); model selection `
+      + `${provider ?? '(profile default)'}/${model ?? '(profile default)'}`,
+    )
 
     // 2. Boot the real pinned assembled DSH Web profile.
     profile = await bootProfile({ dshHome: home.dshHome, repositoryRoot })
@@ -79,9 +89,9 @@ async function main() {
       baseRef: 'main',
       task: 'Inspect the repository; the browser round trip does not depend on the model output.',
       verificationCommand: 'node verify.mjs',
-      provider: home.defaultModel.provider,
-      model: home.defaultModel.model,
-      reasoningEffort: home.defaultModel.reasoningEffort,
+      provider,
+      model,
+      reasoningEffort,
       agentPreset: null,
       permissionPreset: null,
     } })
@@ -180,7 +190,12 @@ async function main() {
     if (page !== undefined) page.close()
     if (browser !== undefined) await browser.stop()
     if (profile !== undefined) await profile.stop()
-    await workspace.cleanup()
+    // Never let a cleanup failure mask the acceptance result, but never report
+    // success when the provisioned workspace could not be released either.
+    await workspace.cleanup().catch((error) => {
+      process.stderr.write(`\nWARNING: the case-sensitive workspace could not be released: ${error?.message ?? error}\n`)
+      process.exitCode = 1
+    })
   }
 }
 

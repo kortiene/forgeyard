@@ -35,10 +35,21 @@ result, never run a verifier unconfined, and never trust model prose as Evidence
 - A **DSH sandbox backend reporting full enforcement** for the frozen
   `workspace-write` mode (macOS `sandbox-exec`/Seatbelt, Linux
   `bubblewrap`/Landlock). Without it, verifiers fail closed with `ERROR`.
-- An **actually configured DSH provider** for the native path. The native
-  harness reuses the operator's real DSH configuration
-  (`~/.dsh/settings.yaml`, `~/.dsh/.credentials.yaml`) in an isolated temporary
-  DSH home. Only **file-based** credentials survive into a spawned DSH process:
+- A **browser whose own sandbox can start**, for the browser path. Hosts that
+  restrict unprivileged user namespaces (Ubuntu 23.10+ and other AppArmor
+  distros) abort Chromium at startup; allow them with
+  `sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`, or set
+  `FORGEYARD_CHROMIUM_NO_SANDBOX=1` to accept an unsandboxed browser for the run.
+  The harness never disables the browser sandbox on its own.
+- An **actually configured DSH provider** for both paths. The harnesses reuse the
+  operator's real DSH configuration (`~/.dsh/settings.yaml`,
+  `~/.dsh/.credentials.yaml`) in an isolated temporary DSH home. Only the
+  credential is required: Mission overrides left null resolve through the pinned
+  profile's own defaults, so no `agent-default-model` block is needed. The
+  operator's `agent-presets.default` is deliberately **not** inherited — it names
+  a preset from the operator's own profile, whose definition and plugins the
+  pinned Forgeyard profile does not ship — so the pinned profile's roster default
+  applies instead. Only **file-based** credentials survive into a spawned DSH process:
   the DSH tool sandbox scrubs credential-shaped environment variables, so a
   provider whose `apiKeyEnv` names an unset variable (for example
   `SAKANA_API_KEY`, `OPENAI_API_KEY`) cannot authenticate here. The Forgeyard
@@ -69,9 +80,12 @@ detach their own image.
 `scripts/browser-roundtrip.mjs` boots the real pinned DSH Web profile, seeds one
 Mission and Attempt through the Host Remote API (setup only), then drives the
 fully assembled graphical application in a real headless Chromium over the Chrome
-DevTools Protocol (no browser-automation dependency; it reuses a Playwright
-Chromium, Chrome for Testing, or system Chrome, or `FORGEYARD_CHROMIUM`). It
-proves, with screenshots at each stage:
+DevTools Protocol (no browser-automation dependency). The browser is
+*discovered*, not guessed: `FORGEYARD_CHROMIUM` first, then any Chromium revision
+Playwright has installed (every `ms-playwright` cache root, including
+`PLAYWRIGHT_BROWSERS_PATH`, newest revision first, any architecture), then PATH,
+then the platform's system Chrome/Chromium. It proves, with screenshots at each
+stage:
 
 1. the real pinned DSH Web profile boots;
 2. the static Forgeyard client loads inside the assembled application;
@@ -113,6 +127,14 @@ successful Attempt 2 — every element the milestone requires, in the only order
 the authority model permits. (This mirrors the vertical-slice and profile-smoke
 Retry chains.)
 
+A verifier exit code is never accepted as success on its own. `verify.mjs` is an
+ordinary worktree file the model can edit, so the same trusted Git Evidence must
+also show the verification contract untouched (no recorded change to
+`verify.mjs`) and `answer.txt` recorded as exactly `42\n` — matched by Git blob
+identity against the complete, untruncated recorded diff. A model that rewrote
+the verifier to exit 0, or that wrote some other value, is reported as an
+`ACCEPTANCE FAILURE`, not a pass.
+
 `PASS` comes only from the Host verifier record, and full confinement is read
 from the command Evidence environment facts (`sandbox-enforcement=full`,
 `sandbox-workspace` equal to the Attempt worktree, `executed-argv-sha256` present
@@ -127,9 +149,14 @@ the change is reported as a genuine `ACCEPTANCE FAILURE`.
 
 - `FORGEYARD_ACCEPT_PROVIDER` / `FORGEYARD_ACCEPT_MODEL` /
   `FORGEYARD_ACCEPT_REASONING` — force a specific model selection instead of the
-  profile default (must be a route whose credential is file-based).
-- `FORGEYARD_MODEL_DEADLINE_MS` — model-turn budget (default 360000).
+  profile default (must be a route whose credential is file-based). Both
+  harnesses honour these.
+- `FORGEYARD_MODEL_DEADLINE_MS` — model-turn budget (default 360000). Must be a
+  finite positive number of milliseconds; anything else is rejected at startup
+  rather than silently producing an unreachable deadline.
 - `FORGEYARD_CHROMIUM` — explicit browser executable for the browser harness.
+- `FORGEYARD_CHROMIUM_NO_SANDBOX=1` — opt in to running Chromium without its own
+  sandbox, for hosts that cannot start it.
 
 ## Interpreting a fail-closed result
 
@@ -137,10 +164,13 @@ the change is reported as a genuine `ACCEPTANCE FAILURE`.
 | --- | --- | --- |
 | `MISSING CAPABILITY: ... case-insensitive` | managed filesystem is case-insensitive | run under a case-sensitive `TMPDIR` (above) |
 | `MISSING CAPABILITY: no Chromium ...` | no browser executable | `npx playwright install chromium` or set `FORGEYARD_CHROMIUM` |
+| `MISSING CAPABILITY: ... cannot start Chromium's own sandbox` | host restricts unprivileged user namespaces | allow them, or set `FORGEYARD_CHROMIUM_NO_SANDBOX=1` |
 | `MISSING CAPABILITY: no operator DSH ...` | no provider credential | configure a provider through DSH |
 | `MISSING CAPABILITY: ... no usable sandbox backend` | sandbox cannot enforce | install/enable the platform sandbox backend |
 | `MISSING CAPABILITY: the native model turn errored (turn/end code=...)` | provider route unusable from a spawned DSH process | use a working file-based provider credential (e.g. `DEEPSEEK_API_KEY`) or override `FORGEYARD_ACCEPT_PROVIDER`/`MODEL` |
 | `ACCEPTANCE FAILURE: ... without writing answer.txt=42` | the provider ran but the model did not make the change | genuine failure (not an environmental gap); inspect the model/route |
+| `ACCEPTANCE FAILURE: ... changed the verifier verify.mjs` | the model altered the verification contract | genuine failure; the PASS is not evidence of the required change |
+| `ACCEPTANCE FAILURE: ... records answer.txt as blob ...` | the verifier passed but the recorded content is not `42\n` | genuine failure; the recorded diff is printed with the error |
 
 None of these are treated as success. A green run prints `PASSED` with the exact
 approved review digest and both Attempt IDs.

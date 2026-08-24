@@ -31,16 +31,29 @@ export async function isCaseSensitive(dir) {
   }
 }
 
+/**
+ * Detach a mounted image, retrying with a forced detach. Throws when the volume
+ * is still mounted after the final attempt so callers never delete the backing
+ * image, or report cleanup success, while the volume is still attached.
+ */
 async function detach(mountpoint) {
+  let lastError = null
   for (let attempt = 0; attempt < 6; attempt += 1) {
     try {
       await execFileAsync('hdiutil', ['detach', mountpoint])
       return
-    } catch {
-      await execFileAsync('hdiutil', ['detach', mountpoint, '-force']).catch(() => {})
-      await new Promise((resolve) => setTimeout(resolve, 500))
+    } catch (error) {
+      lastError = error
     }
+    try {
+      await execFileAsync('hdiutil', ['detach', mountpoint, '-force'])
+      return
+    } catch (error) {
+      lastError = error
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500))
   }
+  throw new Error(`failed to detach the case-sensitive volume at ${mountpoint} after 6 attempts: ${lastError?.stderr ?? lastError?.message ?? String(lastError)}`)
 }
 
 /** Derive the sparse-image path used by mountCaseSensitiveVolume for a mountpoint. */
@@ -68,15 +81,20 @@ export async function mountCaseSensitiveVolume(mountpoint, { sizeGb = 4 } = {}) 
   await execFileAsync('hdiutil', ['attach', image, '-mountpoint', mountpoint, '-nobrowse', '-owners', 'on'])
   const base = await realpath(mountpoint)
   if (!(await isCaseSensitive(base))) {
-    await detach(mountpoint)
-    await rm(image, { force: true })
-    await rmdir(mountpoint).catch(() => {})
+    // Surface a cleanup failure without masking the reason we are bailing out.
+    await unmountCaseSensitiveVolume(mountpoint).catch((cleanupError) => {
+      process.stderr.write(`warning: could not release ${mountpoint}: ${cleanupError?.message ?? String(cleanupError)}\n`)
+    })
     throw new Error('provisioned volume did not report case sensitivity; refusing to proceed')
   }
   return base
 }
 
-/** Detach a mounted case-sensitive volume and delete its backing image. */
+/**
+ * Detach a mounted case-sensitive volume and delete its backing image. Throws
+ * when the volume could not be detached; the image is then left in place rather
+ * than deleted out from under a still-mounted volume.
+ */
 export async function unmountCaseSensitiveVolume(mountpoint) {
   await detach(mountpoint)
   await rm(imagePathFor(mountpoint), { force: true })

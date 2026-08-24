@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { chmod, copyFile, mkdir, readFile, symlink } from 'node:fs/promises'
+import { chmod, copyFile, mkdir, readFile, symlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -10,6 +10,21 @@ export const dshBinary = join(repositoryRoot, 'node_modules', '.bin', process.pl
 export const localProfile = join(repositoryRoot, 'profiles', 'local')
 
 const OPERATOR_CONFIG_FILES = ['settings.yaml', '.credentials.yaml', '.anonymous-user-id']
+
+/**
+ * Drop settings that only make sense inside the operator's own DSH profile.
+ *
+ * `agent-presets.default` names a preset from the operator's profile: its
+ * definition lives outside settings.yaml and it may mount plugins the pinned
+ * Forgeyard profile does not ship, so inheriting it fails every Attempt with
+ * `agent-presets: preset "<name>" not found` or a loader-entry import error.
+ * Removing the block lets the pinned profile's own roster default apply, which
+ * is the preset the acceptance run is supposed to exercise anyway. Provider
+ * routing, credentials, and the default model are untouched.
+ */
+export function withoutProfileScopedSettings(settingsYaml) {
+  return settingsYaml.replace(/^agent-presets:[ \t]*\r?\n(?:[ \t]+.*\r?\n|[ \t]*\r?\n(?=[ \t]+\S))*/mu, '')
+}
 
 /** Resolve the operator's real DSH home that actually holds provider credentials. */
 export function operatorDshHome() {
@@ -57,7 +72,8 @@ export async function prepareOperatorDshHome(base) {
     const from = join(source, file)
     if (!existsSync(from)) continue
     const to = join(dshHome, file)
-    await copyFile(from, to)
+    if (file === 'settings.yaml') await writeFile(to, withoutProfileScopedSettings(await readFile(from, 'utf8')))
+    else await copyFile(from, to)
     if (file.startsWith('.')) await chmod(to, 0o600).catch(() => {})
     copied.push(file)
   }

@@ -103,7 +103,7 @@ The DSH contract suite separately executes the emitted browser bundle in a brows
 pnpm smoke:browser
 ```
 
-The provider-driven acceptance harness requires a usable configured provider and full DSH sandbox enforcement. It runs two real native Attempts: Attempt 1 reaches a complete approvable `PASS` and is sealed by `RETRY`; Attempt 2 uses a new Session/worktree, reaches `PASS`, and is bound to `APPROVE`. It fails closed with the exact public `session.history` `turn/end` provider error when a route cannot execute:
+The provider-driven acceptance harness requires a usable configured provider and full DSH sandbox enforcement. It runs two real native Attempts: Attempt 1 reaches a complete approvable `PASS` and is sealed by `RETRY`; Attempt 2 uses a new Session/worktree, reaches `PASS`, and is bound to `APPROVE`. A verifier exit code alone is never accepted: the same trusted Git Evidence must also show the verification contract untouched and `answer.txt` recorded as exactly the promised bytes, so a model that rewrites the verifier cannot manufacture a pass. It fails closed with the exact public `session.history` `turn/end` provider error when a route cannot execute:
 
 ```sh
 pnpm smoke:native
