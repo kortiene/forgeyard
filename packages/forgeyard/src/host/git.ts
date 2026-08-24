@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { constants } from 'node:fs'
 import type { BigIntStats } from 'node:fs'
-import { lstat, mkdir, open, readlink, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, open, readlink, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type {
   AttemptId,
@@ -1047,12 +1047,16 @@ export class GitAuthority {
     if (!/^attempt_[0-9a-f-]+$/u.test(attemptId)) throw new Error('Attempt ID cannot be used for a promotion scratch file')
     for (const path of promotedPaths) assertReviewablePath(path)
     await this.assertWorktree(prepared)
-    const scratch = await this.promotionScratch()
-    const indexPath = join(scratch, `${attemptId}-${String(process.pid)}.index`)
-    const listPath = join(scratch, `${attemptId}-${String(process.pid)}.pathspec`)
+    // One exclusively created directory per invocation. Neither the Attempt ID
+    // nor the process ID identifies a call: two Engines in one process, or two
+    // containers sharing a PID value, can promote one Attempt at the same
+    // moment, and the tree is built before any row claims the uniqueness
+    // constraint. Sharing these paths would let one call delete the other's
+    // index mid-flight and fail both requests.
+    const workspace = await mkdtemp(join(await this.promotionScratch(), `${attemptId}-`))
+    const indexPath = join(workspace, 'promotion.index')
+    const listPath = join(workspace, 'promotion.pathspec')
     try {
-      await rm(indexPath, { force: true })
-      await rm(listPath, { force: true })
       const env = { GIT_INDEX_FILE: indexPath }
       await this.checked(prepared.path, ['read-tree', '--empty'], env)
       if (promotedPaths.length > 0) {
@@ -1073,8 +1077,7 @@ export class GitAuthority {
       }
       return { tree, entries }
     } finally {
-      await rm(indexPath, { force: true })
-      await rm(listPath, { force: true })
+      await rm(workspace, { recursive: true, force: true })
     }
   }
 

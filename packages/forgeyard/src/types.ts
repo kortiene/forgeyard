@@ -379,7 +379,18 @@ export interface PromotionRecord {
   settledAt: number | null
 }
 
-export type PromotionEligibilityStatus = 'eligible' | 'blocked' | 'promoted' | 'uncertain'
+export type PromotionEligibilityStatus =
+  | 'eligible'
+  | 'blocked'
+  | 'promoted'
+  | 'uncertain'
+  /**
+   * A completed Promotion whose Git ref no longer matches its record. The
+   * SQLite record and the ref are two independent facts and anyone with write
+   * access can delete or move a `refs/forgeyard/` ref; Forgeyard reports the
+   * disagreement rather than resolving it.
+   */
+  | 'diverged'
 
 export interface PromotionEligibility {
   status: PromotionEligibilityStatus

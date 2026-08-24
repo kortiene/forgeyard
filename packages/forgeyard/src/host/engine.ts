@@ -513,7 +513,7 @@ export class ForgeyardEngine {
 
       const attempt = this.requireAttempt(request.attemptId)
       const review = await this.review(attempt)
-      const eligibility = this.promotionEligibility(attempt, review)
+      const eligibility = await this.promotionEligibility(attempt, review)
       if (!eligibility.eligible || eligibility.decisionId === null || eligibility.plannedRef === null) {
         throw new ForgeyardDomainError('PROMOTION_BLOCKED', eligibility.reason ?? 'This Attempt cannot be promoted.')
       }
@@ -870,7 +870,7 @@ export class ForgeyardEngine {
   }
 
   /** Whether this exact Attempt may be promoted right now, and why not. */
-  private promotionEligibility(attempt: AttemptRecord, review: ReviewState): PromotionEligibility {
+  private async promotionEligibility(attempt: AttemptRecord, review: ReviewState): Promise<PromotionEligibility> {
     const promotions = this.store.promotions(attempt.id)
     const active = promotions.find(record => record.status !== 'failed')
     const decision = this.store.decisions(attempt.id).find(record => record.type === 'APPROVE')
@@ -900,6 +900,33 @@ export class ForgeyardEngine {
       }
     }
     if (active?.status === 'promoted') {
+      // A completed record is not self-certifying. The SQLite row and the ref
+      // are two independent facts, and anyone with write access to the
+      // repository can delete or move a `refs/forgeyard/` ref outside
+      // Forgeyard. Naming a durable output that is gone, or that now points
+      // somewhere else, would advertise a deliverable Forgeyard cannot produce.
+      let observed: string | null
+      try {
+        const repository = await this.git.canonicalize(attempt.executionSnapshot.repository.path)
+        observed = await this.git.readPromotionRef(repository.path, active.outputRef)
+      } catch (error) {
+        // Unreadable right now is not the same as diverged, and is not asserted
+        // as either. The record stands and says it was not re-verified.
+        return {
+          ...base,
+          status: 'promoted',
+          reason: `This Attempt was already promoted to ${active.outputRef} at ${active.outputCommit}. The ref could not be read to confirm it right now: ${errorText(error)}`,
+        }
+      }
+      if (observed !== active.outputCommit) {
+        return {
+          ...base,
+          status: 'diverged',
+          reason: observed === null
+            ? `This Attempt was promoted to ${active.outputRef} at ${active.outputCommit}, but that ref no longer exists. Forgeyard reports the disagreement and will not recreate it; inspect the repository before relying on this record.`
+            : `This Attempt was promoted to ${active.outputRef} at ${active.outputCommit}, but that ref now resolves to ${observed}. Forgeyard reports the disagreement and never overwrites the ref; inspect it before relying on this record.`,
+        }
+      }
       return {
         ...base,
         status: 'promoted',
@@ -977,7 +1004,7 @@ export class ForgeyardEngine {
       decisions: this.store.decisions(attempt.id),
       review,
       promotions: this.store.promotions(attempt.id),
-      promotion: this.promotionEligibility(attempt, review),
+      promotion: await this.promotionEligibility(attempt, review),
     }
   }
 

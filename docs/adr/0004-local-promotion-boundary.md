@@ -152,6 +152,17 @@ direction: the Promotion stays `pending` and its lease hands the question to
 reconciliation. A Promotion settles exactly once, by whichever Host gets there
 first; the loser reports that authoritative outcome instead of failing.
 
+A completed Promotion is not self-certifying either. The SQLite record and the
+ref are two independent facts, and anyone with write access to the repository can
+delete or move a `refs/forgeyard/` ref outside Forgeyard, so eligibility reads the
+ref back before reporting an Attempt as promoted. A ref that is absent or holds
+another object is reported as `diverged`, naming both facts; Forgeyard neither
+recreates nor overwrites it, and a ref that cannot be read right now is reported
+as unverified rather than as either answer. Each promotion also builds its tree in
+its own exclusively created scratch directory: the tree is written before any row
+claims the uniqueness constraint, so nothing else keeps two concurrent calls on
+one Attempt from deleting each other's index and pathspec files.
+
 Migration 003 is the first migration that can meet a database another Host is
 already upgrading. The runner therefore re-reads what has actually been applied
 *inside* its `BEGIN IMMEDIATE` transaction, so a Host whose startup version read

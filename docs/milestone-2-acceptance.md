@@ -105,6 +105,8 @@ Git itself refuses).
 | the ref write fails and the ref cannot be read either | nothing is guessed: the Promotion stays `pending` and `uncertain`, and its lease hands the outcome to reconciliation |
 | two Hosts reconcile the same expired Promotion at once | it settles exactly once; the loser reports the authoritative outcome instead of failing its reconciliation or its `promote` request |
 | two Hosts open a shared database needing migration 003 | the migration runner re-reads what is applied inside its write transaction, so the loser skips it instead of failing startup |
+| two Hosts promote one Attempt at the same moment | each builds its tree in its own exclusively created scratch directory, so the loser loses on the durable constraint rather than on a deleted scratch file |
+| a completed promotion's ref is deleted or moved outside Forgeyard | the panel reports `diverged`, naming the recorded commit and what the ref holds now; Forgeyard never recreates or overwrites it |
 | a concurrent promotion of the same Attempt | one succeeds; the other is `PROMOTION_BLOCKED` by the SQLite partial unique index before Git is touched |
 | a repeated promotion of a completed one | `PROMOTION_BLOCKED` with a stable message naming the existing ref and commit |
 | interrupted before the ref existed | once its lease expires the Promotion reconciles to `failed` ("no durable output exists") and the Attempt may be promoted again |
@@ -177,6 +179,7 @@ read a `MISSING CAPABILITY` result.
 | `This Attempt was already promoted to … at …` | the durable output already exists | use the existing ref |
 | `A previous promotion did not settle …` | a promotion is uncertain | make the repository readable and let Forgeyard reconcile it |
 | `A promotion of this Attempt holds a live lease …` | another Host may be promoting this Attempt right now, or one was interrupted moments ago | wait for the lease to lapse, then promote again; Forgeyard reconciles the Promotion against its Git ref first |
+| `… but that ref no longer exists` / `… but that ref now resolves to …` | the promoted ref was deleted or moved outside Forgeyard | inspect the repository; the record and the ref are two independent facts and Forgeyard resolves neither for you |
 
 None of these are treated as success, and none of them modify the operator
 checkout.

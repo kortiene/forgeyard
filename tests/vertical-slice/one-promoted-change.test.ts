@@ -14,6 +14,7 @@ import { ForgeyardDomainError, ForgeyardEngine } from '../../packages/forgeyard/
 import { TrustedEvidenceCollector } from '../../packages/forgeyard/src/host/evidence.ts'
 import type { PolicyOverrides, SessionGateway } from '../../packages/forgeyard/src/host/execution.ts'
 import { GitAuthority } from '../../packages/forgeyard/src/host/git.ts'
+import type { ProcessRunner } from '../../packages/forgeyard/src/host/process.ts'
 import { hashRecord, sha256 } from '../../packages/forgeyard/src/host/hash.ts'
 import { PromotionProjector } from '../../packages/forgeyard/src/host/promotion.ts'
 import { ForgeyardStore, promotionCore } from '../../packages/forgeyard/src/host/store.ts'
@@ -80,8 +81,8 @@ describe('Milestone 2: one promoted change', () => {
   let sessions: DeterministicSessionGateway
   let engine: ForgeyardEngine
 
-  function buildEngine(activeStore: ForgeyardStore): ForgeyardEngine {
-    const git = new GitAuthority(runtime.runner, {
+  function buildEngine(activeStore: ForgeyardStore, runner?: ProcessRunner): ForgeyardEngine {
+    const git = new GitAuthority(runner ?? runtime.runner, {
       allowedRepositoryRoots: [repositoryPath],
       worktreeRoot,
       commandTimeoutMs: 20_000,
@@ -89,7 +90,7 @@ describe('Milestone 2: one promoted change', () => {
       spillBytes: 8 * 1024 * 1024,
       reviewDiffBytes: 256 * 1024,
     })
-    const collector = new TrustedEvidenceCollector(runtime.runner, git, {
+    const collector = new TrustedEvidenceCollector(runner ?? runtime.runner, git, {
       commandTimeoutMs: 20_000,
       outputBytes: 256 * 1024,
       spillBytes: 8 * 1024 * 1024,
@@ -158,6 +159,10 @@ describe('Milestone 2: one promoted change', () => {
       rationale: 'Promote the approved deliverable into a local Forgeyard ref.',
       expectedReviewDigest: digest ?? (attempt.promotion.reviewDigest as string),
     })
+  }
+
+  function errorMessage(value: unknown): string {
+    return value instanceof Error ? value.message : String(value)
   }
 
   async function gitText(cwd: string, argv: readonly string[]): Promise<string> {
@@ -544,6 +549,97 @@ describe('Milestone 2: one promoted change', () => {
     expect(view.promotion).toMatchObject({ status: 'eligible', eligible: true })
     const promoted = await promote(view)
     expect(promoted.promotions.map(item => item.status)).toEqual(['failed', 'promoted'])
+  })
+
+  it('reports a completed promotion whose ref was deleted or moved outside Forgeyard', async () => {
+    const approved = await approvedAttempt()
+    const promoted = await promote(approved)
+    const record = promoted.promotions[0] as PromotionRecord
+    expect(promoted.promotion).toMatchObject({ status: 'promoted', eligible: false })
+
+    // Anyone with write access can delete a `refs/forgeyard/` ref outside
+    // Forgeyard. The SQLite record and the ref are two independent facts.
+    await run(runtime.runner, repositoryPath, ['git', 'update-ref', '-d', record.outputRef])
+    const deleted = await engine.attemptView(approved.attempt.id)
+    expect(deleted.promotion).toMatchObject({ status: 'diverged', eligible: false })
+    expect(deleted.promotion.reason).toMatch(/no longer exists/u)
+    // The disagreement is reported, never resolved: Forgeyard does not recreate
+    // the ref, and the completed record still blocks a second promotion.
+    await expect(promote(deleted)).rejects.toMatchObject<Partial<ForgeyardDomainError>>({ code: 'PROMOTION_BLOCKED' })
+    expect(await engine.git.readPromotionRef(repositoryPath, record.outputRef)).toBeNull()
+    expect(store.promotion(record.id)).toMatchObject({ status: 'promoted', failureReason: null })
+
+    // A ref moved to some other object is reported the same way, naming both.
+    const head = await gitText(repositoryPath, ['git', 'rev-parse', 'HEAD'])
+    const foreign = await gitText(repositoryPath, [
+      'git', 'commit-tree', `${head}^{tree}`, '-p', head, '-m', 'unrelated local commit',
+    ])
+    await run(runtime.runner, repositoryPath, ['git', 'update-ref', record.outputRef, foreign])
+    const moved = await engine.attemptView(approved.attempt.id)
+    expect(moved.promotion).toMatchObject({ status: 'diverged', eligible: false })
+    expect(moved.promotion.reason).toContain(foreign)
+    expect(moved.promotion.reason).toContain(record.outputCommit)
+
+    // Restoring the exact promoted commit restores the agreement.
+    await run(runtime.runner, repositoryPath, ['git', 'update-ref', record.outputRef, record.outputCommit])
+    expect(await engine.attemptView(approved.attempt.id)).toMatchObject({
+      promotion: { status: 'promoted', outputCommit: record.outputCommit },
+    })
+  })
+
+  it('gives each concurrent promotion of one Attempt its own scratch files', async () => {
+    const approved = await approvedAttempt()
+    let gated = false
+    let enteredAdd = (): void => {}
+    let releaseAdd = (): void => {}
+    const atAdd = new Promise<void>((resolve) => { enteredAdd = resolve })
+    const held = new Promise<void>((resolve) => { releaseAdd = resolve })
+    // Hold this Host inside `git add`, after it has written its pathspec file
+    // and while it still needs to read it back.
+    const gatedRunner: ProcessRunner = {
+      run: async (request) => {
+        if (!gated && request.argv.includes('--pathspec-from-file')) {
+          gated = true
+          enteredAdd()
+          await held
+        }
+        return runtime.runner.run(request)
+      },
+    }
+
+    const secondStore = new ForgeyardStore(databasePath)
+    try {
+      const gatedEngine = buildEngine(secondStore, gatedRunner)
+      const request = {
+        attemptId: approved.attempt.id,
+        actor: 'operator',
+        rationale: 'Two Forgeyard Hosts promote one Attempt in one process.',
+        expectedReviewDigest: approved.promotion.reviewDigest as string,
+      }
+      const gatedPromotion = gatedEngine.promote(request).then(() => null, (error: unknown) => error)
+      await atAdd
+
+      // The other Host promotes and completes, running its own scratch cleanup.
+      // Neither the Attempt ID nor the process ID separates these two calls, and
+      // the tree is built before any row claims the uniqueness constraint.
+      await promote(approved)
+      releaseAdd()
+
+      const rejection = await gatedPromotion
+      expect(rejection).toMatchObject<Partial<ForgeyardDomainError>>({ code: 'PROMOTION_BLOCKED' })
+      // It must lose on the durable constraint, not because the other Host's
+      // cleanup deleted the pathspec file out from under its `git add`.
+      expect(errorMessage(rejection)).toMatch(/could not enter promotion/u)
+      expect(errorMessage(rejection)).not.toMatch(/could not be projected/u)
+    } finally {
+      releaseAdd()
+      secondStore.close()
+    }
+
+    const promotions = store.promotions(approved.attempt.id)
+    expect(promotions.filter(item => item.status === 'promoted')).toHaveLength(1)
+    const promoted = promotions.find(item => item.status === 'promoted') as PromotionRecord
+    expect(await engine.git.readPromotionRef(repositoryPath, promoted.outputRef)).toBe(promoted.outputCommit)
   })
 
   it('records a promotion whose ref write landed but whose Git call failed', async () => {

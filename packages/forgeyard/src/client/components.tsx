@@ -869,7 +869,7 @@ function humanize(value: string): string {
 function toneForState(state: string): 'good' | 'bad' | 'active' | 'neutral' {
   if (state === 'approved' || state === 'promoted') return 'good'
   if (state === 'rejected' || state === 'cancelled' || state === 'interrupted'
-    || state === 'failed' || state === 'blocked') return 'bad'
+    || state === 'failed' || state === 'blocked' || state === 'diverged') return 'bad'
   if (state === 'running' || state === 'verifying' || state === 'awaiting_decision'
     || state === 'eligible' || state === 'pending' || state === 'uncertain') return 'active'
   return 'neutral'
