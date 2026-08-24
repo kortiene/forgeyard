@@ -155,6 +155,7 @@ function promotionOf(row: Row): PromotionRecord {
     failureReason: row.failure_reason === null ? null : String(row.failure_reason),
     hash: String(row.hash),
     createdAt: Number(row.created_at),
+    leaseExpiresAt: Number(row.lease_expires_at),
     settledAt: row.settled_at === null ? null : Number(row.settled_at),
   }
 }
@@ -234,10 +235,13 @@ export function assertVerificationRecordIntegrity(record: VerificationRecord): v
  * The immutable half of a Promotion. `status`, `failureReason`, and `settledAt`
  * are the single settle-once lifecycle transition and are deliberately outside
  * the hash so the durable output binding cannot be rewritten by settling.
+ * `leaseExpiresAt` is outside it for the same reason from the other end: the
+ * lease bounds recovery, it is not part of the promoted deliverable's authority.
+ * The schema — not the hash — is what keeps all four from moving.
  */
 export type PromotionAuthority = Omit<
   PromotionRecord,
-  'id' | 'projection' | 'status' | 'failureReason' | 'hash' | 'settledAt'
+  'id' | 'projection' | 'status' | 'failureReason' | 'hash' | 'leaseExpiresAt' | 'settledAt'
 >
 
 export function promotionCore(record: PromotionAuthority): Record<string, unknown> {
@@ -683,6 +687,9 @@ export class ForgeyardStore {
     if (record.status !== 'pending' || record.failureReason !== null || record.settledAt !== null) {
       throw new Error('a Promotion is recorded as pending before its Git ref is created')
     }
+    if (!Number.isSafeInteger(record.leaseExpiresAt) || record.leaseExpiresAt <= record.createdAt) {
+      throw new Error('a pending Promotion carries a lease that outlives its recorded intent')
+    }
     assertPromotionRecordIntegrity(record)
     this.immediate(() => {
       const attempt = this.attempt(record.attemptId)
@@ -695,13 +702,15 @@ export class ForgeyardStore {
       this.database.prepare(`INSERT INTO promotions
         (id,attempt_id,decision_id,review_digest,execution_snapshot_hash,base_commit,worktree_head,
          evidence_digest,verification_digest,projection_json,projection_hash,object_format,
-         output_ref,output_commit,output_tree,status,actor,rationale,failure_reason,hash,created_at,settled_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+         output_ref,output_commit,output_tree,status,actor,rationale,failure_reason,hash,created_at,
+         lease_expires_at,settled_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
         record.id, record.attemptId, record.decisionId, record.reviewDigest, record.executionSnapshotHash,
         record.baseCommit, record.worktreeHead, record.evidenceDigest, record.verificationDigest,
         canonicalJson(record.projection), record.projectionHash, record.objectFormat,
         record.outputRef, record.outputCommit, record.outputTree, record.status,
-        record.actor, record.rationale, record.failureReason, record.hash, record.createdAt, record.settledAt,
+        record.actor, record.rationale, record.failureReason, record.hash, record.createdAt,
+        record.leaseExpiresAt, record.settledAt,
       )
     })
   }

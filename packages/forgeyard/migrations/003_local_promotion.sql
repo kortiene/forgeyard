@@ -20,6 +20,11 @@ CREATE TABLE promotions (
   failure_reason TEXT,
   hash TEXT NOT NULL,
   created_at INTEGER NOT NULL,
+  -- The instant after which a still-pending Promotion is provably abandoned.
+  -- Reconciliation may only settle a pending row from its Git ref once this
+  -- lease has expired, so a promotion still in flight in another Host is never
+  -- failed out from under it. Written once, with the intent, and never moved.
+  lease_expires_at INTEGER NOT NULL,
   settled_at INTEGER
 ) STRICT;
 
@@ -34,6 +39,7 @@ CREATE UNIQUE INDEX promotions_active_ref_idx ON promotions(output_ref) WHERE st
 CREATE TRIGGER promotions_insert_guard
 BEFORE INSERT ON promotions
 WHEN NEW.status <> 'pending' OR NEW.failure_reason IS NOT NULL OR NEW.settled_at IS NOT NULL
+  OR NEW.lease_expires_at <= NEW.created_at
   OR NOT EXISTS (
     SELECT 1 FROM attempts
     WHERE id=NEW.attempt_id AND state='approved'
@@ -50,7 +56,7 @@ BEGIN SELECT RAISE(ABORT, 'a Promotion must begin as one pending record bound to
 CREATE TRIGGER promotions_authority_immutable
 BEFORE UPDATE OF id, attempt_id, decision_id, review_digest, execution_snapshot_hash, base_commit,
   worktree_head, evidence_digest, verification_digest, projection_json, projection_hash, object_format,
-  output_ref, output_commit, output_tree, actor, rationale, hash, created_at ON promotions
+  output_ref, output_commit, output_tree, actor, rationale, hash, created_at, lease_expires_at ON promotions
 BEGIN SELECT RAISE(ABORT, 'promotion authority is immutable'); END;
 
 CREATE TRIGGER promotions_settle_once

@@ -103,7 +103,8 @@ Git itself refuses).
 | the ref already exists | `GIT_ERROR`; a `failed` Promotion is recorded and the existing ref is untouched |
 | a concurrent promotion of the same Attempt | one succeeds; the other is `PROMOTION_BLOCKED` by the SQLite partial unique index before Git is touched |
 | a repeated promotion of a completed one | `PROMOTION_BLOCKED` with a stable message naming the existing ref and commit |
-| interrupted before the ref existed | the Promotion reconciles to `failed` ("no durable output exists") and the Attempt may be promoted again |
+| interrupted before the ref existed | once its lease expires the Promotion reconciles to `failed` ("no durable output exists") and the Attempt may be promoted again |
+| another Host is mid-promotion, between its recorded intent and its ref | the Promotion holds a live lease; reconciliation leaves it `pending`, the Cockpit reports `uncertain`, and no second promotion starts |
 | interrupted after the ref existed | the Promotion reconciles to `promoted` |
 | the ref holds a different object at restart | the Promotion reconciles to `failed`, naming both object names; Forgeyard never overwrites it |
 | the repository is unreadable at restart | the Promotion stays `pending` and the Cockpit reports it as `uncertain`; nothing is promoted until it reconciles |
@@ -125,6 +126,11 @@ already computed.
 4. The panel then shows the promoted record: the ref, the commit, the promoted
    count, the ignored count, the dropped-directory count, the unrepresentable
    mode count, the projection hash, and whether a ledger preview was bounded.
+5. If the Host refuses the promotion, the panel reports the error *and* reloads
+   authoritative state. A refusal is a durable Host outcome — a recorded failure,
+   an existing ref, a Promotion left uncertain — so the panel must never keep
+   rendering the eligible state it showed before the request and invite the
+   operator to press promote again against a Host that has already refused.
 
 ## Running the gate
 
@@ -166,6 +172,7 @@ read a `MISSING CAPABILITY` result.
 | `The Forgeyard promotion ref was not created: … reference already exists` | a ref already occupies the name | inspect it; delete it only after confirming what it is, then promote again |
 | `This Attempt was already promoted to … at …` | the durable output already exists | use the existing ref |
 | `A previous promotion did not settle …` | a promotion is uncertain | make the repository readable and let Forgeyard reconcile it |
+| `A promotion of this Attempt holds a live lease …` | another Host may be promoting this Attempt right now, or one was interrupted moments ago | wait for the lease to lapse, then promote again; Forgeyard reconciles the Promotion against its Git ref first |
 
 None of these are treated as success, and none of them modify the operator
 checkout.

@@ -213,6 +213,72 @@ describe('Forgeyard DSH client contracts', () => {
     expect(controller.attemptIdForSession('session-a')).toBe('attempt-a')
     controller.dispose()
   })
+
+  it('installs authoritative Host state after a promotion the Host refuses', async () => {
+    const base = attempt('attempt-a', 'session-a', 1)
+    const eligible: AttemptView = {
+      ...base,
+      promotion: {
+        ...base.promotion,
+        status: 'eligible',
+        eligible: true,
+        reason: null,
+        reviewDigest: 'd'.repeat(64),
+        decisionId: 'decision-1',
+        plannedRef: 'refs/forgeyard/promotions/attempt-a',
+      },
+    }
+    // A refused promotion is recorded on the Host, so the snapshot it serves
+    // afterwards no longer offers the action and carries the failure reason.
+    const refused: AttemptView = {
+      ...base,
+      promotion: {
+        ...eligible.promotion,
+        status: 'blocked',
+        eligible: false,
+        reason: 'The Forgeyard promotion ref already exists.',
+        failureReason: 'The Forgeyard promotion ref was not created: reference already exists',
+      },
+    }
+    const eligibleSnapshot = forgeyardSnapshot([eligible])
+    const refusedSnapshot = forgeyardSnapshot([refused])
+    let served = 0
+    const snapshot = vi.fn<ForgeyardClientApi['snapshot']>(async () => {
+      served += 1
+      return served === 1 ? eligibleSnapshot : refusedSnapshot
+    })
+    const api: ForgeyardClientApi = {
+      ...apiDouble(eligibleSnapshot),
+      snapshot,
+      promote: vi.fn<ForgeyardClientApi['promote']>(async () => {
+        throw new Error('The Forgeyard promotion ref was not created: reference already exists')
+      }),
+    }
+    const controller = new ForgeyardCockpitController(api, sessionsDouble(['session-a']).sessions)
+    await controller.refresh()
+    expect(controller.getSnapshot().data?.missions[0]?.attempts[0]?.promotion.eligible).toBe(true)
+
+    await controller.promote({
+      attemptId: 'attempt-a',
+      actor: 'operator',
+      rationale: 'Promote the approved deliverable.',
+      expectedReviewDigest: 'd'.repeat(64),
+    })
+
+    const state = controller.getSnapshot()
+    expect(state.busy).toBeNull()
+    expect(state.error).toMatch(/promotion ref was not created/u)
+    // The panel renders what the Host actually holds now — including the newly
+    // recorded failure — instead of the eligible state it showed before the
+    // request, which would invite the operator to click promote again.
+    expect(state.data?.missions[0]?.attempts[0]?.promotion).toMatchObject({
+      status: 'blocked',
+      eligible: false,
+      failureReason: 'The Forgeyard promotion ref was not created: reference already exists',
+    })
+    expect(snapshot).toHaveBeenCalledTimes(2)
+    controller.dispose()
+  })
 })
 
 function mountSlotOwner(ctx: Context): ReturnType<Context['plugin']> {

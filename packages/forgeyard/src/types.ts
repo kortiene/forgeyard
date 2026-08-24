@@ -367,6 +367,15 @@ export interface PromotionRecord {
   failureReason: string | null
   hash: string
   createdAt: number
+  /**
+   * The instant after which a still-pending Promotion is provably abandoned.
+   * The Host that recorded the intent owns it until then, so reconciliation in
+   * another Host never fails a promotion that is still creating its Git ref.
+   * The lease is derived from Git's own hard command timeout, so it cannot
+   * expire while a live Host is still inside the two bounded Git calls that
+   * separate the recorded intent from its settlement.
+   */
+  leaseExpiresAt: number
   settledAt: number | null
 }
 

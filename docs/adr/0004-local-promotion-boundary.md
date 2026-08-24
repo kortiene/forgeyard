@@ -128,6 +128,20 @@ different object settles `failed` naming both object names and refuses to
 overwrite. A repeated promotion of a completed one is rejected with a stable
 message naming the existing ref and commit.
 
+The `pending` row carries a **lease**, and reconciliation may only settle a row
+whose lease has expired. Absent means "no durable output exists" only if nothing
+can still be creating one: several Hosts may share one SQLite authority, and
+reading no ref inside another Host's window between its recorded intent and its
+`git update-ref` proves nothing. Failing the row there would release the
+uniqueness constraint while that Host went on to create a durable ref it could no
+longer settle — an existing output recorded as `failed`, and every later retry
+colliding with the ref it does not know about. The lease is derived from Git's
+own hard command timeout: exactly two bounded Git commands separate the intent
+from its settlement, so a lease of twice that bound plus a margin cannot expire
+while a live Host is still in flight, and it caps how long an abandoned intent
+blocks its Attempt after a Host dies. A leased Promotion is reported as
+`uncertain` and reconciled by the next Host that looks after the lease lapses.
+
 ## Alternatives rejected
 
 - **A `PROMOTE` Decision type.** Requires editing accepted migrations, conflates

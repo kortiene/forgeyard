@@ -191,11 +191,15 @@ export class ForgeyardCockpitController {
    * Perform the explicitly confirmed local promotion of one approved Attempt.
    * The request carries the exact review digest the operator confirmed, so a
    * digest that moved between rendering and confirmation fails closed.
+   *
+   * A refused promotion is a durable Host outcome — a recorded failure, a ref
+   * that already exists, a Promotion left uncertain — so this action refreshes
+   * authoritative state on its failure path as well as its success path.
    */
   async promote(request: PromoteRequest): Promise<void> {
     await this.mutate('Promoting approved deliverable', () => this.api.promote(request), (attempt, data) => {
       return viewForAttempt(data, attempt.attempt.id)
-    })
+    }, { refreshOnFailure: true })
   }
 
   /** Whether an attempt's native Session is presently addressable by `sessions.open`. */
@@ -308,10 +312,17 @@ export class ForgeyardCockpitController {
     })
   }
 
+  /**
+   * `refreshOnFailure` is for operations whose failure is itself recorded on the
+   * Host. Reporting the error alone would leave the panel rendering the state
+   * that existed before the request, hiding the newly recorded outcome and
+   * inviting the operator to repeat an action the Host has already refused.
+   */
   private async mutate<T>(
     label: string,
     operation: () => Promise<T>,
     select: (value: T, data: ForgeyardSnapshot) => CockpitView,
+    options: { readonly refreshOnFailure?: boolean } = {},
   ): Promise<void> {
     if (this.current.busy !== null) return
     const generation = ++this.generation
@@ -327,7 +338,21 @@ export class ForgeyardCockpitController {
       })
     } catch (error) {
       if (!this.isCurrent(generation)) return
-      this.publish({ busy: null, error: messageOf(error) })
+      const message = messageOf(error)
+      if (options.refreshOnFailure === true) {
+        try {
+          const data = await this.api.snapshot()
+          if (!this.isCurrent(generation)) return
+          this.installData(data, { busy: null, phase: 'ready' })
+          // `installData` clears the error; the failure the operator must read
+          // is republished over the refreshed authoritative state.
+          this.publish({ error: message })
+          return
+        } catch {
+          // The refresh failed too. The original failure is what matters.
+        }
+      }
+      this.publish({ busy: null, error: message })
     }
   }
 

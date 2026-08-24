@@ -172,11 +172,17 @@ describe('Milestone 2: one promoted change', () => {
     }
   }
 
-  /** Reproduce the durable state a Host interrupted mid-promotion leaves behind. */
+  /**
+   * Reproduce the durable state a Host interrupted mid-promotion leaves behind.
+   * An interrupted Host's lease has expired by the time anything reconciles it;
+   * `lease: 'live'` instead reproduces a promotion still in flight in a Host
+   * that is between its recorded intent and `git update-ref` right now.
+   */
   async function pendingPromotion(
     attempt: AttemptRecord,
     decision: DecisionRecord,
     outputCommit: string,
+    lease: 'expired' | 'live' = 'expired',
   ): Promise<PromotionRecord> {
     const repository = await engine.git.canonicalize(repositoryPath)
     const prepared = {
@@ -206,7 +212,7 @@ describe('Milestone 2: one promoted change', () => {
       outputTree: await engine.git.readCommitTree(prepared, outputCommit),
       actor: 'operator',
       rationale: 'A promotion interrupted before it settled.',
-      createdAt: Date.now(),
+      createdAt: Date.now() - 3_600_000,
     }
     const record: PromotionRecord = {
       id: 'promotion_interrupted',
@@ -215,6 +221,7 @@ describe('Milestone 2: one promoted change', () => {
       status: 'pending',
       failureReason: null,
       hash: hashRecord(promotionCore({ ...core, projection } as PromotionRecord)),
+      leaseExpiresAt: lease === 'live' ? Date.now() + 3_600_000 : core.createdAt + 1_000,
       settledAt: null,
     }
     store.insertPendingPromotion(record)
@@ -539,6 +546,39 @@ describe('Milestone 2: one promoted change', () => {
     expect(promoted.promotions.map(item => item.status)).toEqual(['failed', 'promoted'])
   })
 
+  it('never fails a promotion another Host may still be creating', async () => {
+    const approved = await approvedAttempt()
+    const decision = approved.decisions[0] as DecisionRecord
+    const record = await pendingPromotion(approved.attempt, decision, approved.attempt.baseCommit, 'live')
+
+    // A second Host reconciles in the window between the first Host's durable
+    // intent and its `git update-ref`. No ref exists yet, and that proves
+    // nothing: failing the row here would release the uniqueness constraint
+    // while the first Host goes on to create a ref it can no longer settle.
+    const secondStore = new ForgeyardStore(databasePath)
+    try {
+      const secondEngine = buildEngine(secondStore)
+      expect(await secondEngine.reconcilePromotions()).toBe(0)
+    } finally {
+      secondStore.close()
+    }
+    expect(store.promotion(record.id)).toMatchObject({ status: 'pending', failureReason: null })
+    expect(await engine.git.readPromotionRef(repositoryPath, record.outputRef)).toBeNull()
+
+    // The in-flight promotion still owns the Attempt, so nothing starts a second one.
+    const view = await engine.attemptView(approved.attempt.id)
+    expect(view.promotion).toMatchObject({ status: 'uncertain', eligible: false })
+    expect(view.promotion.reason).toMatch(/holds a live lease/u)
+    await expect(promote(view)).rejects.toMatchObject<Partial<ForgeyardDomainError>>({ code: 'PROMOTION_BLOCKED' })
+
+    // The owning Host finishes and settles its own promotion exactly once.
+    await engine.git.createPromotionRef(repositoryPath, record.outputRef, record.outputCommit)
+    expect(store.settlePromotion(record.id, 'promoted', null)).toMatchObject({ status: 'promoted' })
+    expect(await engine.attemptView(approved.attempt.id)).toMatchObject({
+      promotion: { status: 'promoted', outputCommit: record.outputCommit },
+    })
+  })
+
   it('reconciles a promotion whose ref was already created before the Host stopped', async () => {
     const approved = await approvedAttempt()
     const decision = approved.decisions[0] as DecisionRecord
@@ -586,6 +626,9 @@ describe('Milestone 2: one promoted change', () => {
     expect(await engine.reconcilePromotions()).toBe(0)
     expect(store.promotions(approved.attempt.id)).toEqual([record])
     expect(() => store.database.prepare('UPDATE promotions SET output_commit=? WHERE id=?').run('0'.repeat(40), record.id))
+      .toThrow(/promotion authority is immutable/u)
+    // A lease that could be shortened is no lease at all.
+    expect(() => store.database.prepare('UPDATE promotions SET lease_expires_at=? WHERE id=?').run(0, record.id))
       .toThrow(/promotion authority is immutable/u)
     expect(() => store.database.prepare("UPDATE promotions SET status='failed', failure_reason='x', settled_at=1 WHERE id=?").run(record.id))
       .toThrow(/settles exactly once/u)

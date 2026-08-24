@@ -50,6 +50,13 @@ export class ForgeyardDomainError extends Error {
 /** The Forgeyard-owned identity every promotion commit is authored with. */
 export const PROMOTION_IDENTITY = { name: 'Forgeyard', email: 'forgeyard@promotion.invalid' } as const
 
+/**
+ * Time added to a promotion lease on top of the Git commands it must cover:
+ * process spawn, SQLite writes, and scheduling between them. It only widens the
+ * window in which a live Host provably owns its own recorded intent.
+ */
+export const PROMOTION_LEASE_MARGIN_MS = 30_000
+
 function trailerText(value: string): string {
   return value.replace(/[\u0000-\u001f\u007f]/gu, ' ').replace(/\s+/gu, ' ').trim().slice(0, 200)
 }
@@ -569,9 +576,35 @@ export class ForgeyardEngine {
         )
         throw new ForgeyardDomainError('GIT_ERROR', boundedReason('The Forgeyard promotion ref did not read back', error))
       }
-      this.store.settlePromotion(planned.record.id, 'promoted', null)
+      try {
+        this.store.settlePromotion(planned.record.id, 'promoted', null)
+      } catch (error) {
+        // The lease makes this unreachable for a live Host, but a settlement
+        // this Host did not perform must never be overwritten or guessed at.
+        // The ref already read back as this promotion's exact commit, so report
+        // the recorded outcome rather than inventing a second one.
+        if (this.store.promotion(planned.record.id)?.status !== 'promoted') {
+          throw new ForgeyardDomainError(
+            'PROMOTION_BLOCKED',
+            boundedReason('The Forgeyard promotion ref exists but its Promotion could not be settled as promoted', error),
+          )
+        }
+      }
       return this.attemptViewUnqueued(attempt.id)
     })
+  }
+
+  /**
+   * How long a recorded promotion intent stays owned by the Host that wrote it.
+   *
+   * Between the durable intent and its settlement Forgeyard runs exactly two
+   * Git commands — `update-ref` and `rev-parse` — and every Git invocation is
+   * hard-bounded by `commandTimeoutMs`. A lease of twice that bound plus a
+   * margin therefore cannot expire while a live Host is still in flight, and it
+   * caps how long an abandoned intent blocks its Attempt after a Host dies.
+   */
+  private promotionLeaseMs(): number {
+    return 2 * this.git.config.commandTimeoutMs + PROMOTION_LEASE_MARGIN_MS
   }
 
   /**
@@ -709,6 +742,7 @@ export class ForgeyardEngine {
       status: 'pending',
       failureReason: null,
       hash: hashRecord(promotionCore(core)),
+      leaseExpiresAt: core.createdAt + this.promotionLeaseMs(),
       settledAt: null,
     }
     return { record }
@@ -724,10 +758,19 @@ export class ForgeyardEngine {
   }
 
   private async reconcilePromotionsUnqueued(attemptId: AttemptId | null): Promise<number> {
+    const now = Date.now()
     const pending = this.store.pendingPromotions()
       .filter(record => attemptId === null || record.attemptId === attemptId)
     let settled = 0
     for (const promotion of pending) {
+      // A recorded intent whose lease is still live belongs to a Host that may
+      // be inside `createPromotionRef` right now. Reading no ref there proves
+      // nothing, and failing the row would release the uniqueness constraint
+      // while that Host goes on to create a durable ref it can no longer
+      // settle. Only an expired lease distinguishes an abandoned intent from a
+      // promotion still in flight, so a leased Promotion is left untouched and
+      // keeps reporting as uncertain.
+      if (promotion.leaseExpiresAt > now) continue
       const attempt = this.store.attempt(promotion.attemptId)
       if (attempt === undefined) continue
       try {
@@ -808,7 +851,9 @@ export class ForgeyardEngine {
       return {
         ...base,
         status: 'uncertain',
-        reason: 'A previous promotion did not settle. Forgeyard reconciles it against its Git ref before this Attempt can be promoted again.',
+        reason: active.leaseExpiresAt > Date.now()
+          ? 'A promotion of this Attempt holds a live lease, so Forgeyard will not start a second one. It reconciles against its Git ref once the lease lapses.'
+          : 'A previous promotion did not settle. Forgeyard reconciles it against its Git ref before this Attempt can be promoted again.',
       }
     }
     if (attempt.state !== 'approved') {
