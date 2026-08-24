@@ -133,6 +133,9 @@ export class ForgeyardService extends TypertRemoteService {
       (error: unknown) => { this.ctx.logger.error(error) },
     )
     installForgeyardAgentAuthority(this.ctx, store, gateway)
+    // The engine arms a timer for the next promotion lease expiry, so it is
+    // disposed with the service rather than outliving it.
+    this.ctx.effect(() => () => { engine.dispose() }, 'forgeyard.promotion.reconcile.stop')
     this.ctx.effect(() => () => store.close(), 'forgeyard.sqlite.close')
   }
 

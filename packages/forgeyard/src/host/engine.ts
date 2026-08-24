@@ -58,6 +58,13 @@ export const PROMOTION_IDENTITY = { name: 'Forgeyard', email: 'forgeyard@promoti
  */
 export const PROMOTION_LEASE_MARGIN_MS = 30_000
 
+/**
+ * How long to wait before looking again at a Promotion whose lease has already
+ * lapsed but which still could not be settled — an unreadable repository, say.
+ * It only bounds a retry; it never shortens the lease itself.
+ */
+export const PROMOTION_RECONCILE_RETRY_MS = 60_000
+
 function trailerText(value: string): string {
   return value.replace(/[\u0000-\u001f\u007f]/gu, ' ').replace(/\s+/gu, ' ').trim().slice(0, 200)
 }
@@ -113,6 +120,10 @@ export class ForgeyardEngine {
 
   private readonly projector: PromotionProjector
 
+  /** The pending reconciliation armed for the earliest live promotion lease. */
+  private leaseTimer: ReturnType<typeof setTimeout> | null = null
+  private disposed = false
+
   constructor(
     readonly store: ForgeyardStore,
     readonly git: GitAuthority,
@@ -124,6 +135,48 @@ export class ForgeyardEngine {
       previewBytes: git.config.reviewDiffBytes,
       spillBytes: git.config.spillBytes,
     })
+  }
+
+  /** Stop the scheduled lease reconciliation. Safe to call more than once. */
+  dispose(): void {
+    this.disposed = true
+    if (this.leaseTimer !== null) {
+      clearTimeout(this.leaseTimer)
+      this.leaseTimer = null
+    }
+  }
+
+  /**
+   * Arm the next reconciliation for the earliest live promotion lease.
+   *
+   * A leased Promotion is deliberately skipped, so a single boot-time pass can
+   * leave one pending indefinitely: the Cockpit reports it as `uncertain` and
+   * the panel hides the promote action while it is ineligible, which means no
+   * operator gesture reaches the on-demand reconciliation inside `promote`.
+   * Forgeyard therefore schedules the pass itself, for the instant the question
+   * becomes answerable. A row whose lease has already lapsed and still did not
+   * settle is retried on a bounded interval instead of spinning.
+   */
+  private scheduleLeaseReconciliation(): void {
+    if (this.leaseTimer !== null) {
+      clearTimeout(this.leaseTimer)
+      this.leaseTimer = null
+    }
+    if (this.disposed) return
+    let earliest: number | null = null
+    for (const record of this.store.pendingPromotions()) {
+      if (earliest === null || record.leaseExpiresAt < earliest) earliest = record.leaseExpiresAt
+    }
+    if (earliest === null) return
+    const remaining = earliest - Date.now()
+    const delay = remaining > 0 ? remaining + 1_000 : PROMOTION_RECONCILE_RETRY_MS
+    this.leaseTimer = setTimeout(() => {
+      this.leaseTimer = null
+      // A pass that cannot run right now leaves the row pending; the pass it
+      // schedules on the way out is what tries again.
+      void this.reconcilePromotions().catch(() => undefined)
+    }, delay)
+    this.leaseTimer.unref?.()
   }
 
   recoverAfterRestart(): number {
@@ -558,6 +611,10 @@ export class ForgeyardEngine {
       } catch (error) {
         throw new ForgeyardDomainError('PROMOTION_BLOCKED', boundedReason('This Attempt could not enter promotion', error))
       }
+      // A durable pending row now exists. If this Host dies here, or the write
+      // outcome stays unknown, its lease is the only thing that can unblock the
+      // Attempt — so the reconciliation that consumes it is armed immediately.
+      this.scheduleLeaseReconciliation()
       try {
         await this.git.createPromotionRef(prepared.repository.path, planned.record.outputRef, planned.record.outputCommit)
       } catch (error) {
@@ -866,6 +923,9 @@ export class ForgeyardEngine {
           )
       if (wrote) settled += 1
     }
+    // Anything still pending is either leased or unsettleable right now. Either
+    // way the next pass is armed here rather than waiting for a Host restart.
+    this.scheduleLeaseReconciliation()
     return settled
   }
 

@@ -110,6 +110,7 @@ Git itself refuses).
 | a concurrent promotion of the same Attempt | one succeeds; the other is `PROMOTION_BLOCKED` by the SQLite partial unique index before Git is touched |
 | a repeated promotion of a completed one | `PROMOTION_BLOCKED` with a stable message naming the existing ref and commit |
 | interrupted before the ref existed | once its lease expires the Promotion reconciles to `failed` ("no durable output exists") and the Attempt may be promoted again |
+| the Host restarts before an interrupted Promotion's lease expires | Forgeyard arms the next reconciliation for the lease expiry itself; the Attempt is released without a second restart or any operator action |
 | another Host is mid-promotion, between its recorded intent and its ref | the Promotion holds a live lease; reconciliation leaves it `pending`, the Cockpit reports `uncertain`, and no second promotion starts |
 | interrupted after the ref existed | the Promotion reconciles to `promoted` |
 | the ref holds a different object at restart | the Promotion reconciles to `failed`, naming both object names; Forgeyard never overwrites it |

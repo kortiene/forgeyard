@@ -140,7 +140,13 @@ own hard command timeout: exactly two bounded Git commands separate the intent
 from its settlement, so a lease of twice that bound plus a margin cannot expire
 while a live Host is still in flight, and it caps how long an abandoned intent
 blocks its Attempt after a Host dies. A leased Promotion is reported as
-`uncertain` and reconciled by the next Host that looks after the lease lapses.
+`uncertain` and reconciled by the next pass once the lease lapses — a pass
+Forgeyard arms itself, for the instant the question becomes answerable. It has
+to: the Cockpit hides the promote action while an Attempt is ineligible, so no
+operator gesture reaches the on-demand reconciliation inside `promote`, and a
+Host that restarts before the lease lapses would otherwise leave the Attempt
+blocked until it restarted again. A row whose lease has lapsed and still cannot
+be settled is retried on a bounded interval rather than spinning.
 
 A ref write that *fails* is equally uninformative: Git can commit its ref
 transaction and still fail the call that ran it, so the error alone never decides

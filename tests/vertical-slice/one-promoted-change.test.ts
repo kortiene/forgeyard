@@ -1,6 +1,6 @@
 import { chmod, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
   AttemptRecord,
   AttemptView,
@@ -117,6 +117,7 @@ describe('Milestone 2: one promoted change', () => {
   })
 
   afterEach(async () => {
+    engine.dispose()
     try { store.close() } catch { /* A test may close the store to simulate a restart. */ }
     await runtime.dispose()
     await rm(root, { recursive: true, force: true })
@@ -188,6 +189,7 @@ describe('Milestone 2: one promoted change', () => {
     decision: DecisionRecord,
     outputCommit: string,
     lease: 'expired' | 'live' = 'expired',
+    liveForMs = 3_600_000,
   ): Promise<PromotionRecord> {
     const repository = await engine.git.canonicalize(repositoryPath)
     const prepared = {
@@ -226,7 +228,7 @@ describe('Milestone 2: one promoted change', () => {
       status: 'pending',
       failureReason: null,
       hash: hashRecord(promotionCore({ ...core, projection } as PromotionRecord)),
-      leaseExpiresAt: lease === 'live' ? Date.now() + 3_600_000 : core.createdAt + 1_000,
+      leaseExpiresAt: lease === 'live' ? Date.now() + liveForMs : core.createdAt + 1_000,
       settledAt: null,
     }
     store.insertPendingPromotion(record)
@@ -712,6 +714,33 @@ describe('Milestone 2: one promoted change', () => {
     expect(await engine.attemptView(approved.attempt.id)).toMatchObject({
       promotion: { status: 'promoted', outputCommit: record.outputCommit },
     })
+  })
+
+  it('reconciles a leased promotion when its lease lapses, without another Host restart', async () => {
+    const approved = await approvedAttempt()
+    const decision = approved.decisions[0] as DecisionRecord
+    // A Host was interrupted mid-promotion and restarted before the lease
+    // lapsed, so the one boot-time pass necessarily skips the row.
+    const record = await pendingPromotion(approved.attempt, decision, approved.attempt.baseCommit, 'live', 400)
+    expect(await engine.reconcilePromotions()).toBe(0)
+
+    const blocked = await engine.attemptView(approved.attempt.id)
+    expect(blocked.promotion).toMatchObject({ status: 'uncertain', eligible: false })
+    // Nothing here is an operator gesture: the panel hides the promote action
+    // while the Attempt is ineligible, so no click can reach the on-demand
+    // reconciliation inside `promote`. Forgeyard has to arm the pass itself.
+    await vi.waitFor(
+      () => { expect(store.promotion(record.id)).toMatchObject({ status: 'failed' }) },
+      { timeout: 10_000, interval: 50 },
+    )
+    expect(store.promotion(record.id)?.failureReason)
+      .toMatch(/interrupted before this promotion created its Git ref/u)
+
+    // The Attempt is released, and an explicit retry promotes it for real.
+    const released = await engine.attemptView(approved.attempt.id)
+    expect(released.promotion).toMatchObject({ status: 'eligible', eligible: true })
+    const promoted = await promote(released)
+    expect(promoted.promotions.map(item => item.status)).toEqual(['failed', 'promoted'])
   })
 
   it('never fails a promotion another Host may still be creating', async () => {
