@@ -37,6 +37,10 @@ describe('real Git promotion projection', () => {
       reviewDiffBytes: 256 * 1024,
     })
     projector = new PromotionProjector({ previewBytes: 256 * 1024, spillBytes: 8 * 1024 * 1024 })
+    // The GitAuthority prepares its managed directories eagerly, and one test
+    // here never issues a Git command. Settle that readiness now, or those
+    // mkdirs land inside the temp root while `afterEach` is removing it.
+    await git.canonicalize(repositoryPath)
   })
 
   afterEach(async () => {

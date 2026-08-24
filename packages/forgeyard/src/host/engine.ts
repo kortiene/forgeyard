@@ -65,6 +65,13 @@ export const PROMOTION_LEASE_MARGIN_MS = 30_000
  */
 export const PROMOTION_RECONCILE_RETRY_MS = 60_000
 
+/**
+ * How often a Host with nothing pending of its own looks again. Several Hosts
+ * can share one database, so a Promotion this Host never inserted — and whose
+ * owner died with its timer — is only ever found by looking.
+ */
+export const PROMOTION_IDLE_POLL_MS = 60_000
+
 function trailerText(value: string): string {
   return value.replace(/[\u0000-\u001f\u007f]/gu, ' ').replace(/\s+/gu, ' ').trim().slice(0, 200)
 }
@@ -105,6 +112,11 @@ export interface EngineConfig {
    * which still could not be settled. Defaults to `PROMOTION_RECONCILE_RETRY_MS`.
    */
   reconcileRetryMs?: number
+  /**
+   * How often to look for a pending Promotion this Host did not insert.
+   * Defaults to `PROMOTION_IDLE_POLL_MS`.
+   */
+  idlePollMs?: number
 }
 
 interface PlannedAttempt {
@@ -161,6 +173,12 @@ export class ForgeyardEngine {
    * Forgeyard therefore schedules the pass itself, for the instant the question
    * becomes answerable. A row whose lease has already lapsed and still did not
    * settle is retried on a bounded interval instead of spinning.
+   *
+   * Finding nothing pending is not a reason to stop looking. Several Hosts can
+   * share one database: a peer can insert a Promotion and die with its own
+   * timer, and nothing pushes that row to this Host. Snapshots do not reconcile
+   * and the Cockpit hides promotion while an Attempt is uncertain, so an idle
+   * Host that dropped its timer would never discover the abandoned row.
    */
   private scheduleLeaseReconciliation(): void {
     if (this.leaseTimer !== null) {
@@ -172,11 +190,12 @@ export class ForgeyardEngine {
     for (const record of this.store.pendingPromotions()) {
       if (earliest === null || record.leaseExpiresAt < earliest) earliest = record.leaseExpiresAt
     }
-    if (earliest === null) return
-    const remaining = earliest - Date.now()
-    const delay = remaining > 0
-      ? remaining + 1_000
-      : this.config.reconcileRetryMs ?? PROMOTION_RECONCILE_RETRY_MS
+    const remaining = earliest === null ? null : earliest - Date.now()
+    const delay = remaining === null
+      ? this.config.idlePollMs ?? PROMOTION_IDLE_POLL_MS
+      : remaining > 0
+        ? remaining + 1_000
+        : this.config.reconcileRetryMs ?? PROMOTION_RECONCILE_RETRY_MS
     this.leaseTimer = setTimeout(() => {
       this.leaseTimer = null
       // A pass that cannot run right now leaves the row pending; the pass it
@@ -1021,6 +1040,10 @@ export class ForgeyardEngine {
       let observed: string | null
       try {
         const repository = await this.git.canonicalize(attempt.executionSnapshot.repository.path)
+        // A repository replaced at the recorded path is a different repository,
+        // whatever it happens to contain. Without this, one holding the same ref
+        // at the same commit would confirm a promotion that never happened in it.
+        this.git.assertRepositorySnapshot(repository, attempt.executionSnapshot.repository)
         observed = await this.git.readPromotionRef(repository.path, active.outputRef)
       } catch (error) {
         // Unreadable right now is not the same as diverged, and is not asserted

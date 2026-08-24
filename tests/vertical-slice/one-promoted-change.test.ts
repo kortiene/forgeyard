@@ -1,4 +1,4 @@
-import { chmod, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, cp, mkdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
@@ -10,7 +10,11 @@ import type {
   PromotionRecord,
   ResolvedPolicySnapshot,
 } from '../../packages/forgeyard/src/types.ts'
-import { ForgeyardDomainError, ForgeyardEngine } from '../../packages/forgeyard/src/host/engine.ts'
+import {
+  ForgeyardDomainError,
+  ForgeyardEngine,
+  type EngineConfig,
+} from '../../packages/forgeyard/src/host/engine.ts'
 import { TrustedEvidenceCollector } from '../../packages/forgeyard/src/host/evidence.ts'
 import type { PolicyOverrides, SessionGateway } from '../../packages/forgeyard/src/host/execution.ts'
 import { GitAuthority } from '../../packages/forgeyard/src/host/git.ts'
@@ -81,7 +85,11 @@ describe('Milestone 2: one promoted change', () => {
   let sessions: DeterministicSessionGateway
   let engine: ForgeyardEngine
 
-  function buildEngine(activeStore: ForgeyardStore, runner?: ProcessRunner): ForgeyardEngine {
+  function buildEngine(
+    activeStore: ForgeyardStore,
+    runner?: ProcessRunner,
+    overrides: Partial<EngineConfig> = {},
+  ): ForgeyardEngine {
     const git = new GitAuthority(runner ?? runtime.runner, {
       allowedRepositoryRoots: [repositoryPath],
       worktreeRoot,
@@ -101,8 +109,10 @@ describe('Milestone 2: one promoted change', () => {
     })
     return new ForgeyardEngine(activeStore, git, sessions, collector, {
       dshVersion: '0.1.1-rc.2',
-      // Keep the bounded retry short enough for a test to observe it.
+      // Keep the bounded retry short enough for a test to observe it. The idle
+      // poll stays at its default so it never fires under an unrelated test.
       reconcileRetryMs: 250,
+      ...overrides,
     })
   }
 
@@ -878,6 +888,54 @@ describe('Milestone 2: one promoted change', () => {
     expect(store.promotion(record.id)?.failureReason)
       .toMatch(/interrupted before this promotion created its Git ref/u)
     store.settlePromotion = settle
+  })
+
+  it('keeps looking for a promotion another Host left behind', async () => {
+    const approved = await approvedAttempt()
+    const decision = approved.decisions[0] as DecisionRecord
+    const peerStore = new ForgeyardStore(databasePath)
+    const peer = buildEngine(peerStore, undefined, { idlePollMs: 200, reconcileRetryMs: 200 })
+    try {
+      // An idle Host that booted with nothing pending. Dropping its timer here
+      // is what leaves an abandoned row undiscovered: nothing pushes another
+      // Host's insert to this one, snapshots do not reconcile, and the Cockpit
+      // hides promotion while the Attempt is uncertain.
+      expect(await peer.reconcilePromotions()).toBe(0)
+
+      // Another Host records the intent and dies with its own timer.
+      const record = await pendingPromotion(approved.attempt, decision, approved.attempt.baseCommit)
+      await vi.waitFor(
+        () => { expect(peerStore.promotion(record.id)).toMatchObject({ status: 'failed' }) },
+        { timeout: 10_000, interval: 50 },
+      )
+      expect(peerStore.promotion(record.id)?.failureReason)
+        .toMatch(/interrupted before this promotion created its Git ref/u)
+    } finally {
+      peer.dispose()
+      peerStore.close()
+    }
+    expect((await engine.attemptView(approved.attempt.id)).promotion)
+      .toMatchObject({ status: 'eligible', eligible: true })
+  })
+
+  it('never confirms a completed promotion against a replaced repository', async () => {
+    const approved = await approvedAttempt()
+    const promoted = await promote(approved)
+    const record = promoted.promotions[0] as PromotionRecord
+    expect(promoted.promotion).toMatchObject({ status: 'promoted' })
+
+    // The repository at the recorded path is replaced by a copy that holds the
+    // same ref at the same commit. Only its identity differs, and identity is
+    // exactly what makes it a different repository.
+    const replacement = `${repositoryPath}.replacement`
+    await cp(repositoryPath, replacement, { recursive: true, verbatimSymlinks: true })
+    await rm(repositoryPath, { recursive: true, force: true })
+    await rename(replacement, repositoryPath)
+    expect(await gitText(repositoryPath, ['git', 'rev-parse', record.outputRef])).toBe(record.outputCommit)
+
+    const view = await engine.attemptView(approved.attempt.id)
+    expect(view.promotion.reason).toMatch(/could not be confirmed/u)
+    expect(view.promotion.reason).toMatch(/repository identity differs/u)
   })
 
   it('never fails a promotion another Host may still be creating', async () => {

@@ -139,7 +139,10 @@ colliding with the ref it does not know about. The lease is derived from Git's
 own hard command timeout: exactly two bounded Git commands separate the intent
 from its settlement, so a lease of twice that bound plus a margin cannot expire
 while a live Host is still in flight, and it caps how long an abandoned intent
-blocks its Attempt after a Host dies. A leased Promotion is reported as
+blocks its Attempt after a Host dies. Finding nothing pending is not a reason to
+stop looking: a peer sharing the database can record an intent and die with its
+own timer, and nothing pushes that row to anyone else, so an idle Host keeps
+polling rather than dropping its timer. A leased Promotion is reported as
 `uncertain` and reconciled by the next pass once the lease lapses — a pass
 Forgeyard arms itself, for the instant the question becomes answerable. It has
 to: the Cockpit hides the promote action while an Attempt is ineligible, so no
