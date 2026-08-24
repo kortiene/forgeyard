@@ -189,7 +189,20 @@ already a symbolic ref is rejected outright. Git otherwise follows a symref, and
 a `refs/forgeyard/promotions/<attempt>` pointed at `refs/heads/<anything>` would
 make Forgeyard create that branch — a write outside `refs/forgeyard/`. `--no-deref`
 alone is not enough, because a symref whose target does not exist has no object
-value and Git silently replaces it. A ref is also not believed on its text alone:
+value and Git silently replaces it.
+
+That check is not atomic with the write, and on Git 2.43 it cannot be made so:
+`update-ref --stdin` rejects a `verify` and a `create` for one ref in a single
+transaction ("multiple updates for ref not allowed"), the `symref-verify`
+primitive that would express it did not arrive until Git 2.45, and a replaced
+dangling symref leaves a reflog byte-identical to a fresh creation, so it cannot
+even be detected afterwards. What `--no-deref` *does* settle atomically is every
+symref with a value: one pointing at an existing ref is refused by the
+compare-and-swap itself. The residual is therefore narrow and is stated rather
+than papered over — a symref pointing at nothing, planted by a repository writer
+inside the window between the check and the write, is replaced. It requires
+write access to the repository, which SECURITY.md already places outside the
+trust boundary, and it cannot produce a write outside `refs/forgeyard/`. A ref is also not believed on its text alone:
 the commit object it names is proven to exist and to be a commit, so a pruned or
 damaged object database is reported instead of advertised as a durable output.
 

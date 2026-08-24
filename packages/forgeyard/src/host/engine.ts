@@ -954,6 +954,7 @@ export class ForgeyardEngine {
     const now = Date.now()
     const pending = this.store.pendingPromotions()
       .filter(record => attemptId === null || record.attemptId === attemptId)
+    const conflicts: string[] = []
     let settled = 0
     for (const promotion of pending) {
       // A recorded intent whose lease is still live belongs to a Host that may
@@ -997,6 +998,26 @@ export class ForgeyardEngine {
             `${promotion.outputRef} already resolves to ${observed} instead of this promotion's commit ${promotion.outputCommit}. Inspect the ref before promoting again.`,
           )
       if (wrote === 'settled') settled += 1
+      else if (wrote === 'conflicted') {
+        // Two Hosts proved opposite things about one ref. Counting this as an
+        // ordinary loss would discard the disagreement the tri-state exists to
+        // report, and let an on-demand promotion continue from a `failed` row
+        // without ever saying that its exact output ref is present.
+        conflicts.push(
+          `${promotion.outputRef} is recorded as ${this.store.promotion(promotion.id)?.status ?? 'unknown'} `
+          + `while this Host observed ${observed ?? 'no ref'} for this promotion's commit ${promotion.outputCommit}`,
+        )
+      }
+    }
+    // Every promotion is still processed first: one disagreement must not stop
+    // the others from settling. It is raised once the pass is complete, and the
+    // `finally` in the caller still arms the next one.
+    if (conflicts.length > 0) {
+      throw new ForgeyardDomainError(
+        'PROMOTION_BLOCKED',
+        `Forgeyard settled a Promotion that disagrees with its Git ref: ${conflicts.join('; ')}. `
+        + 'Inspect the ref before promoting again.',
+      )
     }
     return settled
   }

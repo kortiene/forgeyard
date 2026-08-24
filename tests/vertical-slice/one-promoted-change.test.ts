@@ -938,6 +938,38 @@ describe('Milestone 2: one promoted change', () => {
     expect(view.promotion.reason).toMatch(/repository identity differs/u)
   })
 
+  it('raises a reconciliation whose settlement disagrees with the ref it observed', async () => {
+    const approved = await approvedAttempt()
+    const decision = approved.decisions[0] as DecisionRecord
+    const record = await pendingPromotion(approved.attempt, decision, approved.attempt.baseCommit)
+
+    const peerStore = new ForgeyardStore(databasePath)
+    const peer = buildEngine(peerStore)
+    try {
+      const read = peer.git.readPromotionRef.bind(peer.git)
+      // This Host observes the exact promoted commit. The other read nothing
+      // first and settled `failed`. Counting that as an ordinary loss would
+      // discard the disagreement and let a later promotion continue from the
+      // failed row without ever saying the output ref is present.
+      peer.git.readPromotionRef = async (cwd, ref) => {
+        await engine.git.createPromotionRef(repositoryPath, record.outputRef, record.outputCommit)
+        const observed = await read(cwd, ref)
+        store.settlePromotion(record.id, 'failed', 'The other Host read no ref.')
+        return observed
+      }
+      await expect(peer.reconcilePromotions())
+        .rejects.toMatchObject<Partial<ForgeyardDomainError>>({ code: 'PROMOTION_BLOCKED' })
+    } finally {
+      peer.dispose()
+      peerStore.close()
+    }
+
+    // The settlement another Host wrote stands, and the ref it disagrees with
+    // is still there for an operator to inspect.
+    expect(store.promotion(record.id)).toMatchObject({ status: 'failed' })
+    expect(await engine.git.readPromotionRef(repositoryPath, record.outputRef)).toBe(record.outputCommit)
+  })
+
   it('never fails a promotion another Host may still be creating', async () => {
     const approved = await approvedAttempt()
     const decision = approved.decisions[0] as DecisionRecord
