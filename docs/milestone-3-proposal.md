@@ -9,7 +9,9 @@
   with a downstream dependent must promote, and the unpromoted-output expiry
   risk is surfaced as a Cockpit warning rather than enforced.
 - Revision 4 adds Q6: the public `MissionView` reshape, decided in issue #5, and
-  the commit ordering it forces.
+  the commit ordering it forces. Revision 5 answers two P2 review findings by
+  specifying the exact `TaskNodeView` wire contract and a deterministic,
+  totally ordered rollup precedence, and by asserting the rollup in criterion 7.
 
 ## Why this milestone, and why it is small
 
@@ -232,6 +234,86 @@ reports an honest summary derived from **all** nodes. Criterion 7 needs both.
 | Client | mission detail becomes a node list; `startAttempt` targets an explicit node |
 | Harnesses + tests | ~20 call sites |
 
+#### The exact wire contract
+
+Naming `TaskNodeView` without defining it would leave several incompatible
+Typert designs all satisfying this prose. It is specified here, following the
+existing `PromotionEligibility` precedent of a status union beside a nullable
+human-readable `reason` (`types.ts:382-407`):
+
+```ts
+export type TaskReadinessStatus =
+  /** Every declared dependency is satisfied; an Attempt may be started. */
+  | 'ready'
+  /** At least one dependency is unsatisfied, unsettled, or diverged. */
+  | 'blocked'
+  /**
+   * An upstream Task is rejected. Rejection is terminal per Q3, so no Attempt
+   * of this node can ever become startable; the remedy is a new Mission.
+   */
+  | 'dead'
+
+export interface TaskReadiness {
+  status: TaskReadinessStatus
+  /** True only for `ready`; `startAttempt` must refuse otherwise. */
+  startable: boolean
+  /** Operator-facing explanation. Always set for `blocked` and `dead`. */
+  reason: string | null
+  /** Node keys of unmet dependencies, for the Cockpit's edge rendering. */
+  blockedBy: string[]
+  /**
+   * The upstream promoted commit this node will freeze as its base, resolved
+   * only when `status === 'ready'`. Null for a root node, which uses the
+   * Mission base ref.
+   */
+  baseCommit: string | null
+  /** The upstream Attempt whose Promotion produced `baseCommit`. */
+  baseFromAttemptId: AttemptId | null
+}
+
+export interface TaskNodeView {
+  task: TaskRecord
+  /** Every Attempt of this Task, oldest first — the per-node history. */
+  attempts: AttemptView[]
+  readiness: TaskReadiness
+  /** This node's own state: the latest Attempt state, or 'ready' when none. */
+  nodeState: string
+}
+
+export interface MissionView {
+  mission: MissionRecord
+  tasks: TaskNodeView[]          // replaces `task: TaskRecord`
+  derivedState: MissionRollupState
+}
+```
+
+Note that `MissionView.attempts` also disappears: Attempt history belongs to a
+node, not to the Mission, and a flattened list cannot say which node an Attempt
+came from.
+
+#### Rollup precedence, which must be deterministic
+
+"Derived from all nodes" is not a specification. Two nodes can legitimately hold
+different states at once — A approved and promoted while B is ready with no
+Attempt — so the rollup needs declared values and a **total, ordered** rule.
+`MissionRollupState` is evaluated top-down; the **first** matching row wins:
+
+| # | Condition over all nodes | Rollup |
+| --- | --- | --- |
+| 1 | any node has a `running`/`verifying`/`preparing` Attempt | `running` |
+| 2 | any node awaits a Decision (`awaiting_decision`) | `awaiting_decision` |
+| 3 | any node is `needs_review` or `interrupted` | `needs_review` |
+| 4 | any node readiness is `dead` | `dead` |
+| 5 | any node has a `rejected` or `cancelled` terminal Attempt | `stopped` |
+| 6 | every node is `approved` (and every upstream node promoted) | `complete` |
+| 7 | any node readiness is `ready` | `ready` |
+| 8 | otherwise | `blocked` |
+
+Attention-demanding states outrank quiescent ones, so a Mission never renders
+`complete` or `ready` while any node needs an operator. For today's single-node
+Missions this reduces to exactly the current `attempts.at(-1)` behavior, which
+is what the reshape commit must prove.
+
 Because `smoke:profile` runs inside `pnpm check`, this is a **required-CI-visible**
 change: the safety gate goes red until every consumer moves in the same commit.
 
@@ -265,7 +347,12 @@ A Milestone 3 acceptance run must demonstrate, on a real pinned profile:
    *(B is terminal and unpromoted, so B has no `outputCommit`; the chain is
    asserted through B's worktree, not a B Promotion record.)*
 7. The Cockpit renders both nodes, the dependency edge, per-node readiness with
-   its blocking reason, Attempt state, and the propagated base commit.
+   its blocking reason, Attempt state, and the propagated base commit. The
+   **`MissionView.derivedState` rollup is asserted explicitly** at each stage
+   against the precedence table in Q6 — including at least one genuinely mixed
+   state (A `approved`/promoted while B is `ready` with no Attempt, which must
+   roll up to `ready`, not `complete`) — so the public value is pinned by the
+   acceptance run rather than left to implementation choice.
 8. Every Evidence, Verification, and Decision record for both nodes, **and the
    Promotion record for A**, remains inspectable and append-only.
 9. A rejected upstream reports the terminal `dead` readiness state with an
