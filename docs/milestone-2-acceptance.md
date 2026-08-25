@@ -104,6 +104,9 @@ Git itself refuses).
 | the promotion name is already a symbolic ref | refused before Git is asked to write; the symref is untouched and no branch is created. One pointing at an existing ref is refused atomically by the compare-and-swap; a *dangling* one planted inside the check-to-write window is replaced, which Git 2.43 offers no primitive to prevent (see ADR 0004) |
 | two Hosts reconcile one Promotion to opposite outcomes | the pass settles every other Promotion, then raises the disagreement rather than counting it as an ordinary loss |
 | the promoted commit object is pruned or damaged | the ref is not believed on its text alone; the Promotion is reported as unconfirmed rather than durable |
+| a promoted tree or blob is pruned beneath an intact commit | also reported as unconfirmed: the commit's whole object graph is walked, not just the commit object |
+| an expired Promotion's name is occupied by a symbolic ref | settled `failed` and the Attempt released, rather than repeating the pass forever; the symref is left exactly as found |
+| the repository is replaced between planning and the ref write | the write is refused; reporting the mismatch afterwards could not have undone it |
 | this Host stalls past its own lease before writing the ref | the write is refused, no durable output exists, and the Attempt may be promoted again |
 | two Hosts settle one Promotion in opposite directions | reported as a disagreement; success is never claimed over a record settled the other way |
 | a newer Host migrated the shared database past this one | this Host refuses to initialize rather than run against an unsupported schema |

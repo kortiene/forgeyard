@@ -215,7 +215,25 @@ a moving target aimed outside the namespace, and a symref found at a promotion
 name is reported as a disagreement rather than accepted. Because Forgeyard only
 ever creates a direct ref, a symref at that name also proves no Forgeyard output
 exists there, so a promotion that meets one fails immediately instead of waiting
-out a lease that could not teach it anything more.
+out a lease that could not teach it anything more. Reconciliation settles such a
+row for the same reason, rather than treating the rejection as a repository it
+cannot read and repeating the pass forever.
+
+Nor is a ref believed because its commit object exists: `cat-file -e` proves only
+that one object is present, so a pruned tree or blob beneath it would still be
+advertised as a durable output. The commit's whole object graph is walked instead.
+
+The lease budgets for every Git command the post-intent path runs, and that count
+is measured by a test rather than asserted in a comment — it was written when the
+path was two commands long, silently fell behind as commands were added, and a
+hand recount while fixing it was still off by more than double. The pre-write
+repository identity check is deliberately filesystem-only for the same reason:
+re-canonicalizing would re-run the whole transparency audit, eighteen more
+bounded commands, and triple the lease. With the shipped 120s Git timeout the
+lease is about sixteen minutes, which is the recovery latency an Attempt pays if
+its Host dies mid-promotion; that release is automatic. Renewing the lease
+between commands would cut it to a single command's bound, and is a design change
+to make deliberately rather than a constant to shave.
 
 Migration 003 is the first migration that can meet a database another Host is
 already upgrading. The runner therefore re-reads what has actually been applied

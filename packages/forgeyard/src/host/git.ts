@@ -553,6 +553,30 @@ export class GitAuthority {
     }
   }
 
+  /**
+   * Re-prove that a canonicalized repository is still the same object on disk,
+   * from filesystem identity alone.
+   *
+   * `canonicalize` re-runs the whole transparency audit — six `rev-parse`, six
+   * `config`, five `ls-files`, a `for-each-ref` — which is right when admitting
+   * a repository and wrong inside the promotion lease, where every Git command
+   * is separately timeout-bounded and the lease has to budget for all of them.
+   * What the write path guards against is the repository being *replaced*, and
+   * device/inode identity settles that with no subprocess at all.
+   */
+  async assertRepositoryUnmoved(repository: CanonicalRepository): Promise<void> {
+    const [top, gitDir, commonDir] = await Promise.all([
+      lstat(repository.path, { bigint: true }),
+      lstat(repository.gitDir, { bigint: true }),
+      lstat(repository.commonDir, { bigint: true }),
+    ])
+    if (top.dev !== repository.device || top.ino !== repository.inode
+      || gitDir.dev !== repository.gitDirDevice || gitDir.ino !== repository.gitDirInode
+      || commonDir.dev !== repository.commonDirDevice || commonDir.ino !== repository.commonDirInode) {
+      throw new Error('repository identity on disk differs from the canonicalized repository')
+    }
+  }
+
   assertRepositorySnapshot(repository: CanonicalRepository, snapshot: RepositorySnapshot): void {
     const current = this.repositoryIdentitySnapshot(repository, snapshot.baseRef)
     const { checkoutHead: _head, checkoutStatusHash: _status, ...identity } = snapshot
@@ -1190,14 +1214,21 @@ export class GitAuthority {
     if (!/^[0-9a-f]{40,64}$/u.test(oid)) throw new Error(`Git returned an invalid object name for ${ref}`)
     // `rev-parse --verify` answers from the ref's text alone: a ref left behind
     // by a damaged or pruned object database still reports its recorded object
-    // name. A promoted output nothing can read is not a durable output, so the
-    // object is proven to exist and to be a commit before the ref is believed.
-    const object = await this.invoke(cwd, ['cat-file', '-e', `${oid}^{commit}`])
+    // name. A promoted output nothing can check out is not a durable output.
+    //
+    // `cat-file -e` proves only that the commit object itself is present; it
+    // does not traverse the tree, so a pruned blob would pass it. `rev-list
+    // --objects` walks the commit's whole object graph in one command and fails
+    // if any of it is missing, peels a non-commit, and with `--quiet` prints
+    // nothing, so a large deliverable cannot overrun the capture limit.
+    const object = await this.invoke(cwd, ['rev-list', '--objects', '--no-walk', '--quiet', `${oid}^{commit}`])
     if (object.spawnError !== null || !object.stderr.complete) {
       throw new Error('the Forgeyard promotion commit could not be inspected completely')
     }
     if (object.exitCode !== 0) {
-      throw new Error(`${ref} names ${oid}, but that commit object is not readable in this repository`)
+      throw new Error(
+        `${ref} names ${oid}, but that commit and its promoted objects are not all readable in this repository`,
+      )
     }
     return oid
   }

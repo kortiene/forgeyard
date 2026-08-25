@@ -13,6 +13,8 @@ import type {
 import {
   ForgeyardDomainError,
   ForgeyardEngine,
+  PROMOTION_LEASE_MARGIN_MS,
+  PROMOTION_POST_INTENT_GIT_COMMANDS,
   type EngineConfig,
 } from '../../packages/forgeyard/src/host/engine.ts'
 import { TrustedEvidenceCollector } from '../../packages/forgeyard/src/host/evidence.ts'
@@ -825,10 +827,29 @@ describe('Milestone 2: one promoted change', () => {
       .toBe(record.outputCommit)
 
     await expect(engine.git.readPromotionRef(repositoryPath, record.outputRef))
-      .rejects.toThrow(/that commit object is not readable/u)
+      .rejects.toThrow(/not all readable in this repository/u)
     const damaged = await engine.attemptView(approved.attempt.id)
     expect(damaged.promotion.reason).toMatch(/could not be confirmed/u)
-    expect(damaged.promotion.reason).toMatch(/not readable in this repository/u)
+    expect(damaged.promotion.reason).toMatch(/not all readable in this repository/u)
+  })
+
+  it('refuses a promoted commit whose tree or blobs were pruned beneath it', async () => {
+    const approved = await approvedAttempt()
+    const promoted = await promote(approved)
+    const record = promoted.promotions[0] as PromotionRecord
+
+    // The commit object survives; one promoted blob beneath it does not. A
+    // check of the commit alone is blind to this, but the commit cannot be
+    // checked out, so it is not a durable output.
+    const blob = await gitText(repositoryPath, ['git', 'rev-parse', `${record.outputCommit}:source.txt`])
+    await rm(join(repositoryPath, '.git', 'objects', blob.slice(0, 2), blob.slice(2)), { force: true })
+    expect((await run(runtime.runner, repositoryPath,
+      ['git', 'cat-file', '-e', `${record.outputCommit}^{commit}`], true)).exitCode).toBe(0)
+
+    await expect(engine.git.readPromotionRef(repositoryPath, record.outputRef))
+      .rejects.toThrow(/not all readable in this repository/u)
+    expect((await engine.attemptView(approved.attempt.id)).promotion.reason)
+      .toMatch(/could not be confirmed/u)
   })
 
   it('surfaces an opposite settlement instead of reporting success over it', async () => {
@@ -987,13 +1008,112 @@ describe('Milestone 2: one promoted change', () => {
 
     await expect(engine.git.readPromotionRef(repositoryPath, record.outputRef))
       .rejects.toThrow(/is a symbolic ref to refs\/heads\/moving/u)
+    // A known disagreement, not an unverified read: it must not keep rendering
+    // as a promoted output just because it resolves to the right commit today.
     const view = await engine.attemptView(approved.attempt.id)
-    expect(view.promotion.reason).toMatch(/could not be confirmed/u)
-    expect(view.promotion.reason).toMatch(/is a symbolic ref/u)
+    expect(view.promotion).toMatchObject({ status: 'diverged', eligible: false })
+    expect(view.promotion.reason).toMatch(/now a symbolic ref to refs\/heads\/moving/u)
 
     // And it really was a moving target: the branch advances, the "output" follows.
     await run(runtime.runner, repositoryPath, ['git', 'branch', '-f', 'moving', approved.attempt.baseCommit])
     expect(await gitText(repositoryPath, ['git', 'rev-parse', record.outputRef])).toBe(approved.attempt.baseCommit)
+  })
+
+  it('settles an expired promotion whose name is occupied by a symbolic ref', async () => {
+    const approved = await approvedAttempt()
+    const decision = approved.decisions[0] as DecisionRecord
+    const record = await pendingPromotion(approved.attempt, decision, approved.attempt.baseCommit)
+    await run(runtime.runner, repositoryPath, ['git', 'branch', 'elsewhere', approved.attempt.baseCommit])
+    await run(runtime.runner, repositoryPath, ['git', 'symbolic-ref', record.outputRef, 'refs/heads/elsewhere'])
+
+    // Forgeyard can prove it never created this: it only ever writes a direct
+    // ref. Treating the rejection as transient unreadability would repeat every
+    // pass forever and leave the Attempt blocked with nothing to press.
+    expect(await engine.reconcilePromotions()).toBe(1)
+    expect(store.promotion(record.id)).toMatchObject({ status: 'failed' })
+    expect(store.promotion(record.id)?.failureReason).toMatch(/symbolic ref to refs\/heads\/elsewhere/u)
+
+    // The Attempt is released, and the planted symref is left exactly as found.
+    expect((await engine.attemptView(approved.attempt.id)).promotion)
+      .toMatchObject({ status: 'eligible', eligible: true })
+    expect(await gitText(repositoryPath, ['git', 'symbolic-ref', record.outputRef])).toBe('refs/heads/elsewhere')
+  })
+
+  it('never writes a promotion ref into a repository replaced after planning', async () => {
+    const approved = await approvedAttempt()
+    const write = engine.git.createPromotionRef.bind(engine.git)
+    let wrote = 0
+    engine.git.createPromotionRef = async (cwd, ref, commit) => {
+      wrote += 1
+      return write(cwd, ref, commit)
+    }
+    // The repository at the authorized path is replaced between planning and
+    // the write. `prepared.repository` is a cached identity, so Git would
+    // resolve the path afresh and create the ref inside the replacement.
+    const view = engine.git.promotionView.bind(engine.git)
+    engine.git.promotionView = async (prepared) => {
+      const result = await view(prepared)
+      const replacement = `${repositoryPath}.replacement`
+      await cp(repositoryPath, replacement, { recursive: true, verbatimSymlinks: true })
+      await rm(repositoryPath, { recursive: true, force: true })
+      await rename(replacement, repositoryPath)
+      return result
+    }
+
+    await expect(promote(approved)).rejects.toMatchObject<Partial<ForgeyardDomainError>>({ code: 'GIT_ERROR' })
+    // Reporting the mismatch afterwards could not have undone the write.
+    expect(wrote).toBe(0)
+    expect(await gitText(repositoryPath, ['git', 'for-each-ref', '--format=%(refname)', 'refs/forgeyard/'])).toBe('')
+    const record = store.promotions(approved.attempt.id)[0] as PromotionRecord
+    expect(record).toMatchObject({ status: 'failed' })
+    expect(record.failureReason).toMatch(/no longer matches the Attempt snapshot/u)
+  })
+
+  it('budgets the promotion lease for every Git command run after the intent', async () => {
+    const approved = await approvedAttempt()
+    // The lease must cover the whole post-intent path. It was written when that
+    // path was two commands long and silently fell behind as commands were
+    // added, so the count is measured against a real promotion rather than
+    // asserted: a peer settling the row while one of them is still live is the
+    // exact disagreement the lease exists to prevent.
+    let counting = false
+    const observed: string[] = []
+    const countingRunner: ProcessRunner = {
+      run: async (request) => {
+        if (counting) {
+          const verb = request.argv.findIndex((a, i) => i > 0 && !a.startsWith('-') && !a.includes('='))
+          observed.push(request.argv.slice(verb, verb + 2).join(' '))
+        }
+        return runtime.runner.run(request)
+      },
+    }
+    const countingStore = new ForgeyardStore(databasePath)
+    try {
+      const counted = buildEngine(countingStore, countingRunner)
+      const insert = countingStore.insertPendingPromotion.bind(countingStore)
+      countingStore.insertPendingPromotion = (record) => { insert(record); counting = true }
+      const settle = countingStore.settlePromotion.bind(countingStore)
+      countingStore.settlePromotion = (id, status, reason) => {
+        counting = false
+        return settle(id, status, reason)
+      }
+
+      const promoted = await counted.promote({
+        attemptId: approved.attempt.id,
+        actor: 'operator',
+        rationale: 'Measure the post-intent Git path.',
+        expectedReviewDigest: approved.promotion.reviewDigest as string,
+      })
+      counted.dispose()
+
+      expect(observed.length).toBeGreaterThan(0)
+      expect(observed.length).toBeLessThanOrEqual(PROMOTION_POST_INTENT_GIT_COMMANDS)
+      const record = promoted.promotions[0] as PromotionRecord
+      expect(record.leaseExpiresAt - record.createdAt)
+        .toBeGreaterThanOrEqual(observed.length * 20_000 + PROMOTION_LEASE_MARGIN_MS)
+    } finally {
+      countingStore.close()
+    }
   })
 
   it('never fails a promotion another Host may still be creating', async () => {

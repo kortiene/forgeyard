@@ -59,6 +59,27 @@ export const PROMOTION_IDENTITY = { name: 'Forgeyard', email: 'forgeyard@promoti
 export const PROMOTION_LEASE_MARGIN_MS = 30_000
 
 /**
+ * Bounded Git commands between the durable intent and its settlement, each one
+ * capped separately by `commandTimeoutMs`:
+ *
+ *   2  `createPromotionRef`:  `symbolic-ref`, `update-ref`
+ *   3  `readPromotionRef`:    `symbolic-ref`, `rev-parse`, `rev-list`
+ *   3  headroom for the failure path, which probes and reads before settling
+ *
+ * The pre-write identity check deliberately spends none of this: it compares
+ * filesystem identity rather than re-canonicalizing, which would have added
+ * eighteen more commands and tripled the lease.
+ *
+ * Counted rather than asserted. This budget was written when the path really
+ * was two commands long and silently fell behind as commands were added — and a
+ * hand count while fixing that was off by more than double — so a test now walks
+ * a real promotion and fails if the commands it observes outnumber this.
+ * Budgeting fewer than the code runs would let a peer settle the row mid-flight,
+ * which is the disagreement the lease exists to stop.
+ */
+export const PROMOTION_POST_INTENT_GIT_COMMANDS = 8
+
+/**
  * How long to wait before looking again at a Promotion whose lease has already
  * lapsed but which still could not be settled — an unreadable repository, say.
  * It only bounds a retry; it never shortens the lease itself.
@@ -641,6 +662,20 @@ export class ForgeyardEngine {
       // outcome stays unknown, its lease is the only thing that can unblock the
       // Attempt — so the reconciliation that consumes it is armed immediately.
       this.scheduleLeaseReconciliation()
+      // The repository at the authorized path can be replaced between planning
+      // and this write. `prepared.repository` is a cached identity, so Git would
+      // resolve the path afresh and create the ref inside the replacement — and
+      // the completed-output check can report that afterwards but cannot undo it.
+      try {
+        // Filesystem identity only: see `assertRepositoryUnmoved`. The full
+        // audit here would triple the commands the lease must budget for.
+        await this.git.assertRepositoryUnmoved(prepared.repository)
+        this.git.assertRepositorySnapshot(prepared.repository, attempt.executionSnapshot.repository)
+      } catch (error) {
+        const moved = 'The repository at the authorized path no longer matches the Attempt snapshot, so no promotion ref was written'
+        this.failPromotion(planned.record.id, moved, error)
+        throw new ForgeyardDomainError('GIT_ERROR', boundedReason(moved, error))
+      }
       // Git's hard command timeout bounds time spent *inside* a Git call, not
       // time this Host can lose to a stopped process, a container freeze, or a
       // long garbage collection between the recorded intent and this write. A
@@ -707,14 +742,21 @@ export class ForgeyardEngine {
   /**
    * How long a recorded promotion intent stays owned by the Host that wrote it.
    *
-   * Between the durable intent and its settlement Forgeyard runs exactly two
-   * Git commands — `update-ref` and `rev-parse` — and every Git invocation is
-   * hard-bounded by `commandTimeoutMs`. A lease of twice that bound plus a
-   * margin therefore cannot expire while a live Host is still in flight, and it
-   * caps how long an abandoned intent blocks its Attempt after a Host dies.
+   * Every Git invocation is hard-bounded by `commandTimeoutMs`, so the lease is
+   * that bound times the number of bounded commands the post-intent path runs —
+   * see `PROMOTION_POST_INTENT_GIT_COMMANDS` — plus a margin.
+   *
+   * This is deliberately a worst case, and it is paid in recovery latency: with
+   * the shipped 120s Git timeout the lease is about sixteen minutes, so an
+   * Attempt whose Host died mid-promotion reports `uncertain` for that long
+   * before the scheduled pass releases it. That is automatic and needs no
+   * operator action, and it is the right side to err on — under-budgeting risks
+   * a durable ref recorded as failed. Renewing the lease between commands would
+   * shorten it to a single command's bound; that is a design change to make
+   * deliberately, not a constant to shave.
    */
   private promotionLeaseMs(): number {
-    return 2 * this.git.config.commandTimeoutMs + PROMOTION_LEASE_MARGIN_MS
+    return PROMOTION_POST_INTENT_GIT_COMMANDS * this.git.config.commandTimeoutMs + PROMOTION_LEASE_MARGIN_MS
   }
 
   /**
@@ -991,16 +1033,29 @@ export class ForgeyardEngine {
         continue
       }
       let observed: string | null
+      let symbolic: string | null = null
       try {
         const repository = await this.git.canonicalize(attempt.executionSnapshot.repository.path)
         this.git.assertRepositorySnapshot(repository, attempt.executionSnapshot.repository)
-        observed = await this.git.readPromotionRef(repository.path, promotion.outputRef)
+        // A symref at the promotion name is not transient unreadability. It is
+        // proof that no Forgeyard-owned output exists there, because Forgeyard
+        // only ever creates a direct ref and refuses to write through a symref.
+        // Treating it as unreadable would repeat this pass forever and keep the
+        // Attempt blocked with no operator gesture able to reach it.
+        symbolic = await this.git.promotionSymrefTarget(repository.path, promotion.outputRef)
+        observed = symbolic !== null ? null : await this.git.readPromotionRef(repository.path, promotion.outputRef)
       } catch {
         // The repository is unreadable right now. The Promotion stays pending
         // and the Cockpit reports it as uncertain rather than guessing.
         continue
       }
-      const wrote = observed === promotion.outputCommit
+      const wrote = symbolic !== null
+        ? this.settleReconciled(
+          promotion.id,
+          'failed',
+          `${promotion.outputRef} is a symbolic ref to ${symbolic}, so no Forgeyard-owned output exists at that name. Remove it before promoting this Attempt again.`,
+        )
+        : observed === promotion.outputCommit
         ? this.settleReconciled(promotion.id, 'promoted', null)
         : observed === null
           ? this.settleReconciled(
@@ -1075,13 +1130,17 @@ export class ForgeyardEngine {
       // Forgeyard. Naming a durable output that is gone, or that now points
       // somewhere else, would advertise a deliverable Forgeyard cannot produce.
       let observed: string | null
+      let symbolic: string | null = null
       try {
         const repository = await this.git.canonicalize(attempt.executionSnapshot.repository.path)
         // A repository replaced at the recorded path is a different repository,
         // whatever it happens to contain. Without this, one holding the same ref
         // at the same commit would confirm a promotion that never happened in it.
         this.git.assertRepositorySnapshot(repository, attempt.executionSnapshot.repository)
-        observed = await this.git.readPromotionRef(repository.path, active.outputRef)
+        // A symref at the name is a known disagreement, not an unverified read,
+        // and must not keep rendering as a promoted output.
+        symbolic = await this.git.promotionSymrefTarget(repository.path, active.outputRef)
+        observed = symbolic !== null ? null : await this.git.readPromotionRef(repository.path, active.outputRef)
       } catch (error) {
         // Unreadable right now is not the same as diverged, and is not asserted
         // as either. The record stands and says it was not re-verified.
@@ -1089,6 +1148,13 @@ export class ForgeyardEngine {
           ...base,
           status: 'promoted',
           reason: `This Attempt was already promoted to ${active.outputRef} at ${active.outputCommit}. That could not be confirmed: ${errorText(error)}`,
+        }
+      }
+      if (symbolic !== null) {
+        return {
+          ...base,
+          status: 'diverged',
+          reason: `This Attempt was promoted to ${active.outputRef} at ${active.outputCommit}, but that name is now a symbolic ref to ${symbolic}. Forgeyard only ever creates a direct ref, so this is not its output — and what it resolves to follows that ref whenever it moves.`,
         }
       }
       if (observed !== active.outputCommit) {
