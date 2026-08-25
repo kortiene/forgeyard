@@ -113,7 +113,7 @@ try {
 
   const emptySnapshot = await remote('snapshot', {})
   if (!Array.isArray(emptySnapshot?.missions) || emptySnapshot?.dshVersion !== '0.1.1-rc.2'
-    || emptySnapshot?.schemaVersion !== 2) {
+    || emptySnapshot?.schemaVersion !== 3) {
     throw new Error(`Forgeyard initial snapshot is incompatible: ${JSON.stringify(emptySnapshot)}`)
   }
   const mission = await remote('createMission', { request: {
@@ -189,6 +189,7 @@ try {
 
   const retryVerified = await verifyWhenIdle(retry.attempt.id)
   let decisionOutcome
+  let promotionRecord
   if (retryVerified.review?.canApprove === true && retryVerified.verifications?.[0]?.status === 'PASS') {
     const approved = await remote('decide', { request: {
       attemptId: retry.attempt.id,
@@ -200,7 +201,53 @@ try {
       || approved.decisions?.[0]?.reviewDigest !== retryVerified.review.reviewDigest) {
       throw new Error(`Forgeyard real-profile approval did not bind the exact review: ${JSON.stringify(approved)}`)
     }
-    decisionOutcome = 'Retry/new Session/worktree and passing Attempt 2 approval'
+    // Milestone 2: approval alone must not deliver anything. Promotion is a
+    // separate, explicitly confirmed action bound to the exact approved digest.
+    if (approved.promotion?.status !== 'eligible' || approved.promotion?.eligible !== true
+      || approved.promotion?.reviewDigest !== approved.decisions[0].reviewDigest
+      || approved.promotions?.length !== 0 || approved.promotion?.outputCommit !== null) {
+      throw new Error(`Forgeyard approval did not leave promotion pending and eligible: ${JSON.stringify(approved.promotion)}`)
+    }
+    const wrongDigest = await invokeRemote('promote', { request: {
+      attemptId: retry.attempt.id,
+      actor: 'profile-smoke',
+      rationale: 'A digest the operator never approved must never promote.',
+      expectedReviewDigest: '0'.repeat(64),
+    } })
+    if (wrongDigest?.ok !== false || wrongDigest.error?.code !== 'PROMOTION_BLOCKED') {
+      throw new Error(`Forgeyard promoted an unconfirmed review digest: ${JSON.stringify(wrongDigest)}`)
+    }
+    const promoted = await remote('promote', { request: {
+      attemptId: retry.attempt.id,
+      actor: 'profile-smoke',
+      rationale: 'Promote exactly the approved Attempt 2 deliverable into a local Forgeyard ref.',
+      expectedReviewDigest: approved.decisions[0].reviewDigest,
+    } })
+    const record = promoted.promotions?.[0]
+    if (promoted.promotions?.length !== 1 || record?.status !== 'promoted'
+      || record.reviewDigest !== approved.decisions[0].reviewDigest
+      || record.decisionId !== approved.decisions[0].id
+      || record.outputRef !== `refs/forgeyard/promotions/${retry.attempt.id}`
+      || !/^[0-9a-f]{40,64}$/u.test(record.outputCommit ?? '')
+      || record.projection?.promoted?.count + record.projection?.excluded?.count
+        !== record.projection?.manifestEntryCount) {
+      throw new Error(`Forgeyard promotion did not produce one bound durable record: ${JSON.stringify(promoted.promotions)}`)
+    }
+    if (promoted.promotion?.status !== 'promoted' || promoted.promotion?.eligible !== false) {
+      throw new Error(`Forgeyard did not report the Attempt as promoted: ${JSON.stringify(promoted.promotion)}`)
+    }
+    const repeated = await invokeRemote('promote', { request: {
+      attemptId: retry.attempt.id,
+      actor: 'profile-smoke',
+      rationale: 'Repeating a completed promotion must be refused with a stable explanation.',
+      expectedReviewDigest: approved.decisions[0].reviewDigest,
+    } })
+    if (repeated?.ok !== false || repeated.error?.code !== 'PROMOTION_BLOCKED'
+      || !repeated.error.message.includes(record.outputCommit)) {
+      throw new Error(`Forgeyard repeated a completed promotion: ${JSON.stringify(repeated)}`)
+    }
+    promotionRecord = record
+    decisionOutcome = 'Retry/new Session/worktree, passing Attempt 2 approval, and one explicit local promotion'
   } else {
     const command = retryVerified.evidence.find(item => item.payload?.kind === 'verification-command')
     if (retryVerified.review?.canApprove !== false || retryVerified.verifications?.[0]?.status !== 'ERROR'
@@ -226,7 +273,19 @@ try {
       || rejected.decisions?.[0]?.reviewDigest !== retryVerified.review.reviewDigest) {
       throw new Error(`Forgeyard real-profile rejection did not bind the exact review: ${JSON.stringify(rejected)}`)
     }
-    decisionOutcome = 'Retry/new Session/worktree plus sandbox-unavailable Attempt 2 rejection with approval blocked'
+    const promotionBlocked = await invokeRemote('promote', { request: {
+      attemptId: retry.attempt.id,
+      actor: 'profile-smoke',
+      rationale: 'A rejected Attempt must never be promotable.',
+      expectedReviewDigest: retryVerified.review.reviewDigest,
+    } })
+    if (promotionBlocked?.ok !== false || promotionBlocked.error?.code !== 'PROMOTION_BLOCKED') {
+      throw new Error(`Forgeyard promoted a rejected Attempt: ${JSON.stringify(promotionBlocked)}`)
+    }
+    if (rejected.promotion?.status !== 'blocked' || rejected.promotion?.eligible !== false) {
+      throw new Error(`Forgeyard did not block promotion for a rejected Attempt: ${JSON.stringify(rejected.promotion)}`)
+    }
+    decisionOutcome = 'Retry/new Session/worktree plus sandbox-unavailable Attempt 2 rejection with approval and promotion blocked'
   }
 
   child.kill('SIGTERM')
@@ -247,11 +306,13 @@ try {
     database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count,
   ]))
   database.close()
-  const expected = ['attempts', 'decisions', 'evidence', 'missions', 'schema_migrations', 'tasks', 'verifications']
+  const expected = [
+    'attempts', 'decisions', 'evidence', 'missions', 'promotions', 'schema_migrations', 'tasks', 'verifications',
+  ]
   if (JSON.stringify(tables) !== JSON.stringify(expected)) {
     throw new Error(`Forgeyard Host schema mismatch: ${JSON.stringify(tables)}`)
   }
-  if (schemaVersion !== 2 || counts.missions !== 1 || counts.tasks !== 1 || counts.attempts !== 2) {
+  if (schemaVersion !== 3 || counts.missions !== 1 || counts.tasks !== 1 || counts.attempts !== 2) {
     throw new Error(`Forgeyard Host authority mismatch: schema=${String(schemaVersion)} counts=${JSON.stringify(counts)}`)
   }
   if (await readFile(join(repository, 'source.txt'), 'utf8') !== 'base\n') {
@@ -259,7 +320,65 @@ try {
   }
   const { stdout: baseStatus } = await execFileAsync('git', ['status', '--porcelain=v2', '-z', '--untracked-files=all'], { cwd: repository })
   if (baseStatus !== '') throw new Error('Forgeyard profile smoke left the base checkout dirty')
-  process.stdout.write(`Forgeyard profile smoke passed: DSH Web ${url}, native Session/worktree, ${decisionOutcome}, Host schema ${tables.length}/7.\n`)
+  const { stdout: baseHead } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: repository })
+  const { stdout: baseBranch } = await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: repository })
+  if (baseBranch.trim() !== 'main') throw new Error('Forgeyard profile smoke moved the base checkout off its branch')
+  if (promotionRecord !== undefined) {
+    // The durable output must survive the Host and be inspectable from the
+    // operator's own checkout, without having moved that checkout at all.
+    const { stdout: refCommit } = await execFileAsync(
+      'git', ['rev-parse', '--verify', `${promotionRecord.outputRef}^{commit}`], { cwd: repository },
+    )
+    if (refCommit.trim() !== promotionRecord.outputCommit) {
+      throw new Error(`Forgeyard promotion ref does not resolve to the recorded commit: ${refCommit.trim()}`)
+    }
+    const { stdout: refTree } = await execFileAsync(
+      'git', ['rev-parse', '--verify', `${promotionRecord.outputCommit}^{tree}`], { cwd: repository },
+    )
+    if (refTree.trim() !== promotionRecord.outputTree) {
+      throw new Error(`Forgeyard promotion commit does not carry the recorded tree: ${refTree.trim()}`)
+    }
+    const { stdout: parents } = await execFileAsync(
+      'git', ['rev-list', '--parents', '-n', '1', promotionRecord.outputCommit], { cwd: repository },
+    )
+    if (parents.trim().split(/\s+/u).slice(1).join(' ') !== promotionRecord.baseCommit) {
+      throw new Error(`Forgeyard promotion commit is not a single child of the Attempt base: ${parents.trim()}`)
+    }
+    const { stdout: heads } = await execFileAsync('git', ['for-each-ref', '--format=%(refname)', 'refs/heads/'], { cwd: repository })
+    if (heads.split('\n').filter(Boolean).join(',') !== 'refs/heads/main' || baseHead.trim() === promotionRecord.outputCommit) {
+      throw new Error('Forgeyard promotion changed an operator branch instead of its own ref namespace')
+    }
+    // Exact correspondence, recomputed from the operator's own repository after
+    // the Host is gone: the promoted tree holds precisely the declared entries,
+    // each at the exact object name Forgeyard recorded for the reviewed bytes.
+    const projection = promotionRecord.projection
+    if (projection.promoted.previewTruncated || projection.excluded.previewTruncated) {
+      throw new Error('the profile smoke fixture unexpectedly exceeded the promotion ledger preview budget')
+    }
+    const { stdout: listed } = await execFileAsync(
+      'git', ['ls-tree', '-r', '-z', '--full-tree', promotionRecord.outputCommit], { cwd: repository },
+    )
+    const treeEntries = listed.split('\0').filter(Boolean).map((record) => {
+      const [meta, path] = record.split('\t')
+      const [mode, , oid] = meta.split(' ')
+      return { mode, oid, path }
+    })
+    const declared = [...projection.promoted.preview].sort((left, right) => left.path.localeCompare(right.path))
+    const actual = [...treeEntries].sort((left, right) => left.path.localeCompare(right.path))
+    if (actual.length !== declared.length
+      || declared.some((entry, index) => actual[index].path !== entry.path
+        || actual[index].mode !== entry.gitMode || actual[index].oid !== entry.blobOid)) {
+      throw new Error(`the promoted tree is not the declared projection: ${JSON.stringify({ declared, actual })}`)
+    }
+    const { stdout: promotedSource } = await execFileAsync(
+      'git', ['cat-file', 'blob', `${promotionRecord.outputCommit}:source.txt`], { cwd: repository },
+    )
+    if (promotedSource !== 'base\n') {
+      throw new Error(`the promoted commit does not carry the reviewed source.txt bytes: ${JSON.stringify(promotedSource)}`)
+    }
+    decisionOutcome += ` (ref ${promotionRecord.outputRef} at ${promotionRecord.outputCommit.slice(0, 12)})`
+  }
+  process.stdout.write(`Forgeyard profile smoke passed: DSH Web ${url}, native Session/worktree, ${decisionOutcome}, Host schema ${tables.length}/8.\n`)
 } finally {
   if (child !== undefined && child.exitCode === null) child.kill('SIGKILL')
   await Promise.all([

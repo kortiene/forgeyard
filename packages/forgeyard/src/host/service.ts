@@ -19,6 +19,7 @@ import type {
   ForgeyardSnapshot,
   MissionCreateRequest,
   MissionView,
+  PromoteRequest,
   RetryRequest,
   TaskId,
 } from '../types.ts'
@@ -121,7 +122,20 @@ export class ForgeyardService extends TypertRemoteService {
 
     const recovered = this.engine.recoverAfterRestart()
     if (recovered > 0) this.ctx.logger.warn(`forgeyard: marked ${recovered} uncertain Attempt(s) needs_review after Host restart`)
+    // Promotions interrupted mid-flight are settled against their durable Git
+    // ref. This is best effort at boot: a repository that is not readable right
+    // now keeps its Promotion pending, and `promote` reconciles it on demand.
+    const engine = this.engine
+    void engine.reconcilePromotions().then(
+      (settled) => {
+        if (settled > 0) this.ctx.logger.warn(`forgeyard: reconciled ${settled} uncertain Promotion(s) after Host restart`)
+      },
+      (error: unknown) => { this.ctx.logger.error(error) },
+    )
     installForgeyardAgentAuthority(this.ctx, store, gateway)
+    // The engine arms a timer for the next promotion lease expiry, so it is
+    // disposed with the service rather than outliving it.
+    this.ctx.effect(() => () => { engine.dispose() }, 'forgeyard.promotion.reconcile.stop')
     this.ctx.effect(() => () => store.close(), 'forgeyard.sqlite.close')
   }
 
@@ -168,6 +182,11 @@ export class ForgeyardService extends TypertRemoteService {
   @Remote('retry')
   retry(request: RetryRequest): Promise<ForgeyardResult<AttemptView>> {
     return this.result(() => this.requireEngine().retry(request))
+  }
+
+  @Remote('promote')
+  promote(request: PromoteRequest): Promise<ForgeyardResult<AttemptView>> {
+    return this.result(() => this.requireEngine().promote(request))
   }
 
   @Remote('attemptForSession')

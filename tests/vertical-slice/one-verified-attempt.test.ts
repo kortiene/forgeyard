@@ -236,7 +236,9 @@ describe('Milestone 1: one verified Attempt', () => {
     const tables = (store.database.prepare(
       "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
     ).all() as Array<{ name: string }>).map(row => row.name)
-    expect(tables).toEqual(['attempts', 'decisions', 'evidence', 'missions', 'schema_migrations', 'tasks', 'verifications'])
+    expect(tables).toEqual([
+      'attempts', 'decisions', 'evidence', 'missions', 'promotions', 'schema_migrations', 'tasks', 'verifications',
+    ])
     expect((store.database.prepare('PRAGMA journal_mode').get() as { journal_mode: string }).journal_mode).toBe('wal')
     expect((store.database.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys).toBe(1)
     expect((store.database.prepare('PRAGMA busy_timeout').get() as { timeout: number }).timeout).toBe(5_000)

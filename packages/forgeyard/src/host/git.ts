@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { constants } from 'node:fs'
 import type { BigIntStats } from 'node:fs'
-import { lstat, mkdir, open, readlink, readdir, realpath, rename, stat } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, open, readlink, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type {
   AttemptId,
@@ -16,6 +16,21 @@ import { canonicalJson, sha256 } from './hash.ts'
 import { bounded, type ProcessResult, type ProcessRunner } from './process.ts'
 
 export type { RawWorkspaceManifest, WorkspaceManifestEntry } from '../types.ts'
+
+/**
+ * A promotion output that is present but provably not what its record claims —
+ * a symbolic ref, an unreadable object graph, an invalid object name. It will
+ * not resolve by looking again, so it is reported and settled rather than
+ * retried like an I/O failure.
+ */
+export class PromotionRefDisagreement extends Error {}
+
+/**
+ * The repository at the recorded path is not the one a record refers to. Also
+ * definitive, but it is not a statement about the ref: the recorded output may
+ * still exist in the original repository, wherever that now is.
+ */
+export class RepositoryIdentityMismatch extends Error {}
 
 export interface GitAuthorityConfig {
   allowedRepositoryRoots: readonly string[]
@@ -46,6 +61,30 @@ export interface PreparedWorktree {
   device: bigint
   inode: bigint
   baselineManifest: RawWorkspaceManifest
+}
+
+/** Git's own view of the reviewed worktree, used to prove the promotion projection. */
+export interface PromotionGitView {
+  fingerprint: GitFingerprint
+  manifest: RawWorkspaceManifest
+  headCommit: string
+  objectFormat: 'sha1' | 'sha256'
+  tracked: string[]
+  untracked: string[]
+  ignored: string[]
+}
+
+export interface PromotionTreeEntry {
+  mode: string
+  oid: string
+  path: string
+}
+
+export interface PromotionIdentity {
+  name: string
+  email: string
+  /** Whole seconds since the epoch; the timezone is always `+0000`. */
+  epochSeconds: number
 }
 
 export interface RawWorkspaceManifestDelta {
@@ -289,7 +328,11 @@ export class GitAuthority {
     return this.assertPrivateDirectory(expected, requireEmpty)
   }
 
-  private async invoke(cwd: string, args: readonly string[]): Promise<ProcessResult> {
+  private async invoke(
+    cwd: string,
+    args: readonly string[],
+    extraEnv: Readonly<Record<string, string>> = {},
+  ): Promise<ProcessResult> {
     const hooks = await this.hooksRoot
     await this.assertPrivateDirectory(hooks, true)
     const env: NodeJS.ProcessEnv = {}
@@ -306,6 +349,13 @@ export class GitAuthority {
       LC_ALL: 'C',
       LANG: 'C',
     })
+    // Explicit Forgeyard-owned Git variables (scratch index, literal pathspecs,
+    // and the deterministic promotion identity) are applied after the ambient
+    // GIT_* scrub so no operator environment can redirect them.
+    for (const [key, value] of Object.entries(extraEnv)) {
+      if (!/^GIT_[A-Z0-9_]+$/u.test(key)) throw new Error(`unsupported Forgeyard Git environment name: ${key}`)
+      env[key] = value
+    }
     return this.runner.run({
       argv: [
         'git', '--no-pager', '--no-replace-objects',
@@ -330,8 +380,12 @@ export class GitAuthority {
     })
   }
 
-  private async checked(cwd: string, args: readonly string[]): Promise<string> {
-    const result = await this.invoke(cwd, args)
+  private async checked(
+    cwd: string,
+    args: readonly string[],
+    extraEnv: Readonly<Record<string, string>> = {},
+  ): Promise<string> {
+    const result = await this.invoke(cwd, args, extraEnv)
     if (result.spawnError !== null || result.exitCode !== 0 || !result.stdout.complete || !result.stderr.complete) {
       const detail = result.spawnError ?? (result.stderr.text.trim() || `exit ${String(result.exitCode)}`)
       throw new Error(`git ${args[0] ?? ''} failed: ${detail}`)
@@ -514,11 +568,35 @@ export class GitAuthority {
     }
   }
 
+  /**
+   * Re-prove that a canonicalized repository is still the same object on disk,
+   * from filesystem identity alone.
+   *
+   * `canonicalize` re-runs the whole transparency audit — six `rev-parse`, six
+   * `config`, five `ls-files`, a `for-each-ref` — which is right when admitting
+   * a repository and wrong inside the promotion lease, where every Git command
+   * is separately timeout-bounded and the lease has to budget for all of them.
+   * What the write path guards against is the repository being *replaced*, and
+   * device/inode identity settles that with no subprocess at all.
+   */
+  async assertRepositoryUnmoved(repository: CanonicalRepository): Promise<void> {
+    const [top, gitDir, commonDir] = await Promise.all([
+      lstat(repository.path, { bigint: true }),
+      lstat(repository.gitDir, { bigint: true }),
+      lstat(repository.commonDir, { bigint: true }),
+    ])
+    if (top.dev !== repository.device || top.ino !== repository.inode
+      || gitDir.dev !== repository.gitDirDevice || gitDir.ino !== repository.gitDirInode
+      || commonDir.dev !== repository.commonDirDevice || commonDir.ino !== repository.commonDirInode) {
+      throw new RepositoryIdentityMismatch('repository identity on disk differs from the canonicalized repository')
+    }
+  }
+
   assertRepositorySnapshot(repository: CanonicalRepository, snapshot: RepositorySnapshot): void {
     const current = this.repositoryIdentitySnapshot(repository, snapshot.baseRef)
     const { checkoutHead: _head, checkoutStatusHash: _status, ...identity } = snapshot
     if (canonicalJson(current) !== canonicalJson(identity)) {
-      throw new Error('repository identity differs from the durable Mission snapshot')
+      throw new RepositoryIdentityMismatch('repository identity differs from the durable Mission snapshot')
     }
   }
 
@@ -934,6 +1012,296 @@ export class GitAuthority {
       throw new Error('Attempt worktree changed while its live Git fingerprint was being collected')
     }
     return first.payload.fingerprint
+  }
+
+  /**
+   * Read Git's complete view of the reviewed worktree twice and refuse a view
+   * that moved between reads. The manifest is the same trusted raw-workspace
+   * collection the Evidence fingerprint is built from, so a caller can bind
+   * the projection to the exact reviewed `workspaceHash`.
+   */
+  async promotionView(prepared: PreparedWorktree): Promise<PromotionGitView> {
+    const first = await this.readPromotionView(prepared)
+    const second = await this.readPromotionView(prepared)
+    if (canonicalJson(first) !== canonicalJson(second)) {
+      throw new Error('Attempt worktree changed while its promotion projection was being read')
+    }
+    return first
+  }
+
+  private async readPromotionView(prepared: PreparedWorktree): Promise<PromotionGitView> {
+    await this.assertWorktree(prepared)
+    await this.assertTransparentGitView(prepared.path, prepared.repository.commonDir)
+    const [format, head, tracked, untracked, ignored] = await Promise.all([
+      this.checked(prepared.path, ['rev-parse', '--show-object-format']).then(cleanLine),
+      this.checked(prepared.path, ['rev-parse', 'HEAD']).then(cleanLine),
+      this.checked(prepared.path, ['ls-files', '-z', '--']),
+      this.checked(prepared.path, ['ls-files', '--others', '--exclude-standard', '-z', '--']),
+      this.checked(prepared.path, ['ls-files', '--others', '--ignored', '--exclude-standard', '-z', '--']),
+    ])
+    if (format !== 'sha1' && format !== 'sha256') {
+      throw new Error(`unsupported Git object format for promotion: ${format}`)
+    }
+    const fingerprint = await this.liveFingerprint(prepared)
+    const manifest = await this.collectWorkspaceManifest(prepared.path)
+    if (manifest.hash !== fingerprint.workspaceHash) {
+      throw new Error('the raw workspace changed between its fingerprint and its promotion manifest')
+    }
+    const collect = (text: string): string[] => {
+      const paths = nulFields(text)
+      for (const path of paths) assertReviewablePath(path)
+      return [...paths].sort(compareUtf8)
+    }
+    return {
+      fingerprint,
+      manifest,
+      headCommit: head,
+      objectFormat: format,
+      tracked: collect(tracked),
+      untracked: collect(untracked),
+      ignored: collect(ignored),
+    }
+  }
+
+  /** A private mode-`0700` directory for promotion scratch index/pathspec files. */
+  private async promotionScratch(): Promise<string> {
+    const root = await this.managedRoot
+    return this.prepareDirectory(join(root, '.promotion'), false)
+  }
+
+  /**
+   * Build the promoted tree from an explicit path list in a scratch index.
+   *
+   * The Attempt worktree's own index, working tree, and HEAD are untouched:
+   * `GIT_INDEX_FILE` redirects every index write, and `git add` never writes
+   * working-tree bytes. `GIT_LITERAL_PATHSPECS` stops a path that contains
+   * glob characters from matching anything but itself, and `-f` is deliberately
+   * not passed so a listed path Git considers ignored fails the promotion.
+   */
+  async writePromotionTree(
+    prepared: PreparedWorktree,
+    attemptId: AttemptId,
+    promotedPaths: readonly string[],
+  ): Promise<{ tree: string; entries: PromotionTreeEntry[] }> {
+    if (!/^attempt_[0-9a-f-]+$/u.test(attemptId)) throw new Error('Attempt ID cannot be used for a promotion scratch file')
+    for (const path of promotedPaths) assertReviewablePath(path)
+    await this.assertWorktree(prepared)
+    // One exclusively created directory per invocation. Neither the Attempt ID
+    // nor the process ID identifies a call: two Engines in one process, or two
+    // containers sharing a PID value, can promote one Attempt at the same
+    // moment, and the tree is built before any row claims the uniqueness
+    // constraint. Sharing these paths would let one call delete the other's
+    // index mid-flight and fail both requests.
+    const workspace = await mkdtemp(join(await this.promotionScratch(), `${attemptId}-`))
+    const indexPath = join(workspace, 'promotion.index')
+    const listPath = join(workspace, 'promotion.pathspec')
+    try {
+      const env = { GIT_INDEX_FILE: indexPath }
+      await this.checked(prepared.path, ['read-tree', '--empty'], env)
+      if (promotedPaths.length > 0) {
+        await writeFile(listPath, `${promotedPaths.join('\0')}\0`, { mode: 0o600 })
+        await this.checked(prepared.path, [
+          'add', '--pathspec-from-file', listPath, '--pathspec-file-nul', '--',
+        ], { ...env, GIT_LITERAL_PATHSPECS: '1' })
+      }
+      const tree = cleanLine(await this.checked(prepared.path, ['write-tree'], env))
+      const staged = nulFields(await this.checked(prepared.path, ['ls-files', '--stage', '-z'], env))
+      const entries: PromotionTreeEntry[] = []
+      for (const record of staged) {
+        const match = /^([0-7]{6}) ([0-9a-f]{40,64}) ([0-3])\t(.*)$/su.exec(record)
+        if (match === null) throw new Error('unexpected git ls-files --stage output while building the promoted tree')
+        if (match[3] !== '0') throw new Error('the promoted index contains an unmerged entry')
+        assertReviewablePath(match[4] as string)
+        entries.push({ mode: match[1] as string, oid: match[2] as string, path: match[4] as string })
+      }
+      return { tree, entries }
+    } finally {
+      await rm(workspace, { recursive: true, force: true })
+    }
+  }
+
+  /** Flatten a written tree back to its exact blob entries for correspondence proof. */
+  async readTreeEntries(prepared: PreparedWorktree, tree: string): Promise<PromotionTreeEntry[]> {
+    if (!/^[0-9a-f]{40,64}$/u.test(tree)) throw new Error('invalid promoted tree object name')
+    const listing = nulFields(await this.checked(prepared.path, ['ls-tree', '-r', '-z', '--full-tree', tree]))
+    return listing.map((record) => {
+      const match = /^([0-7]{6}) (blob|tree|commit|tag) ([0-9a-f]{40,64})\t(.*)$/su.exec(record)
+      if (match === null) throw new Error('unexpected git ls-tree output for the promoted tree')
+      if (match[2] !== 'blob') throw new Error(`the promoted tree contains a non-blob ${match[2] as string} entry`)
+      assertReviewablePath(match[4] as string)
+      return { mode: match[1] as string, oid: match[3] as string, path: match[4] as string }
+    })
+  }
+
+  /**
+   * Create the promotion commit object with a fully pinned identity so the same
+   * approved deliverable always yields the same commit name. No ref is moved.
+   */
+  async createPromotionCommit(
+    prepared: PreparedWorktree,
+    tree: string,
+    parent: string,
+    message: string,
+    identity: PromotionIdentity,
+  ): Promise<string> {
+    if (!/^[0-9a-f]{40,64}$/u.test(tree) || !/^[0-9a-f]{40,64}$/u.test(parent)) {
+      throw new Error('invalid promotion tree or parent object name')
+    }
+    if (!Number.isSafeInteger(identity.epochSeconds) || identity.epochSeconds < 0) {
+      throw new Error('promotion identity requires a whole non-negative epoch second')
+    }
+    if (/[<>\n\0]/u.test(identity.name) || /[<>\n\0]/u.test(identity.email)) {
+      throw new Error('promotion identity name and email must not contain Git delimiter characters')
+    }
+    const date = `${String(identity.epochSeconds)} +0000`
+    const env = {
+      GIT_AUTHOR_NAME: identity.name,
+      GIT_AUTHOR_EMAIL: identity.email,
+      GIT_AUTHOR_DATE: date,
+      GIT_COMMITTER_NAME: identity.name,
+      GIT_COMMITTER_EMAIL: identity.email,
+      GIT_COMMITTER_DATE: date,
+    }
+    const commit = cleanLine(await this.checked(prepared.path, [
+      // Signing would make the commit name depend on a key and a clock, so the
+      // deterministic promotion identity is the only authorship claim made.
+      '-c', 'commit.gpgsign=false',
+      // A repository-local `i18n.commitEncoding` adds an `encoding` header and
+      // changes the commit's object name for the same tree, parent, message,
+      // identity, and date. Ambient configuration must not decide what a
+      // promotion is called: the whole recovery story depends on a retry
+      // recomputing the same commit as the attempt that preceded it.
+      '-c', 'i18n.commitEncoding=UTF-8',
+      'commit-tree', tree, '-p', parent, '-m', message,
+    ], env))
+    if (!/^[0-9a-f]{40,64}$/u.test(commit)) throw new Error('Git returned an invalid promotion commit object name')
+    return commit
+  }
+
+  /** Read the tree a promotion commit carries, without moving any ref. */
+  async readCommitTree(prepared: PreparedWorktree, commit: string): Promise<string> {
+    if (!/^[0-9a-f]{40,64}$/u.test(commit)) throw new Error('invalid promotion commit object name')
+    const tree = cleanLine(await this.checked(prepared.path, ['rev-parse', '--verify', '--end-of-options', `${commit}^{tree}`]))
+    if (!/^[0-9a-f]{40,64}$/u.test(tree)) throw new Error('Git returned an invalid promoted tree object name')
+    return tree
+  }
+
+  /** Reference name for the one Forgeyard-owned promotion output of an Attempt. */
+  static promotionRef(attemptId: AttemptId): string {
+    if (!/^attempt_[0-9a-f-]+$/u.test(attemptId)) throw new Error('Attempt ID cannot be used for a Forgeyard promotion ref')
+    return `refs/forgeyard/promotions/${attemptId}`
+  }
+
+  private assertPromotionRef(ref: string): void {
+    if (!/^refs\/forgeyard\/promotions\/attempt_[0-9a-f-]+$/u.test(ref)) {
+      throw new Error(`Forgeyard only writes refs under refs/forgeyard/promotions/: ${ref}`)
+    }
+  }
+
+  /**
+   * The target this promotion name points at, or null when it is an ordinary
+   * ref. Git dereferences symbolic refs recursively by default, so the resolved
+   * object name alone cannot tell a Forgeyard-owned ref from a symref aimed
+   * somewhere else that happens to resolve to the same commit today.
+   */
+  async promotionSymrefTarget(cwd: string, ref: string): Promise<string | null> {
+    this.assertPromotionRef(ref)
+    const result = await this.invoke(cwd, ['symbolic-ref', '--quiet', '--', ref])
+    if (result.spawnError !== null || !result.stdout.complete) {
+      throw new Error('the Forgeyard promotion ref could not be inspected for a symbolic ref')
+    }
+    return result.exitCode === 0 ? cleanLine(result.stdout.text) : null
+  }
+
+  /** Read a Forgeyard promotion ref without creating it. */
+  async readPromotionRef(cwd: string, ref: string): Promise<string | null> {
+    this.assertPromotionRef(ref)
+    // A promotion output is one Forgeyard-owned ref naming one fixed commit.
+    // A symref that resolves to the recorded commit today is a moving target
+    // pointing outside that namespace — the branch it names can advance and
+    // silently change what the promotion claims to have delivered. Forgeyard
+    // never creates one, so finding one is a disagreement, not an output.
+    const symbolic = await this.promotionSymrefTarget(cwd, ref)
+    if (symbolic !== null) {
+      throw new PromotionRefDisagreement(
+        `${ref} is a symbolic ref to ${symbolic}; Forgeyard never creates one and will not read through it`,
+      )
+    }
+    const result = await this.invoke(cwd, ['rev-parse', '--verify', '--quiet', '--end-of-options', ref])
+    if (result.spawnError !== null || !result.stdout.complete || !result.stderr.complete) {
+      throw new Error('the Forgeyard promotion ref could not be read completely')
+    }
+    if (result.exitCode === 1 && result.stdout.text.trim() === '') {
+      // Exit 1 with empty stdout means "no such ref" only when Git also said
+      // nothing. A ref file holding a malformed object name exits identically
+      // but warns `ignoring broken ref` on stderr, and the namespace is still
+      // occupied: reporting that as absent would settle a pending row as "no
+      // durable output exists" and send every retry into a collision with the
+      // ref that is sitting right there.
+      const warning = result.stderr.text.trim()
+      if (warning === '') return null
+      throw new PromotionRefDisagreement(`${ref} exists but Git cannot read it: ${warning}`)
+    }
+    if (result.exitCode !== 0) throw new Error(`git rev-parse failed for ${ref}: ${result.stderr.text.trim()}`)
+    const oid = cleanLine(result.stdout.text)
+    if (!/^[0-9a-f]{40,64}$/u.test(oid)) {
+      throw new PromotionRefDisagreement(`Git returned an invalid object name for ${ref}`)
+    }
+    // `rev-parse --verify` answers from the ref's text alone: a ref left behind
+    // by a damaged or pruned object database still reports its recorded object
+    // name. A promoted output nothing can check out is not a durable output.
+    //
+    // `cat-file -e` proves only that the commit object itself is present; it
+    // does not traverse the tree, so a pruned blob would pass it. `rev-list
+    // --objects` walks the whole object graph in one command and fails if any
+    // of it is missing, peels a non-commit, and with `--quiet` prints nothing,
+    // so a large deliverable cannot overrun the capture limit.
+    //
+    // `--max-count=2` rather than `--no-walk`: the promotion commit names a
+    // frozen base parent, and `--no-walk` would not follow that edge, so a
+    // pruned base commit still read as a durable output while `git show` on it
+    // failed. Two is the promotion and its one parent — enough to prove the
+    // edge the record claims, without walking the repository's whole history.
+    const object = await this.invoke(cwd, ['rev-list', '--objects', '--quiet', '--max-count=2', `${oid}^{commit}`])
+    if (object.spawnError !== null || !object.stderr.complete) {
+      throw new Error('the Forgeyard promotion commit could not be inspected completely')
+    }
+    if (object.exitCode !== 0) {
+      throw new PromotionRefDisagreement(
+        `${ref} names ${oid}, but that commit and its promoted objects are not all readable in this repository`,
+      )
+    }
+    return oid
+  }
+
+  /**
+   * Create the Forgeyard promotion ref with Git's own compare-and-swap. An
+   * empty expected value means "must not exist", so a colliding ref (another
+   * Forgeyard process, or an operator-created name) loses atomically inside
+   * Git's ref transaction instead of being silently overwritten.
+   *
+   * `--no-deref` makes that compare-and-swap apply to this ref name itself. Git
+   * otherwise follows a symbolic ref, so a `refs/forgeyard/promotions/<attempt>`
+   * pre-created as a symref to `refs/heads/<anything>` would satisfy the
+   * must-not-exist check at its *target* and make Forgeyard create that branch —
+   * a write outside `refs/forgeyard/`, which Forgeyard guarantees it never does.
+   * `--no-deref` alone is not enough: a symref whose target does not exist has
+   * no object value, so the must-not-exist check passes and Git silently
+   * replaces the symref. A promotion name that is already symbolic is therefore
+   * rejected outright, because Forgeyard never overwrites a ref it did not create.
+   */
+  async createPromotionRef(cwd: string, ref: string, commit: string): Promise<void> {
+    this.assertPromotionRef(ref)
+    if (!/^[0-9a-f]{40,64}$/u.test(commit)) throw new Error('invalid promotion commit object name')
+    const symbolic = await this.promotionSymrefTarget(cwd, ref)
+    if (symbolic !== null) {
+      throw new Error(`${ref} is a symbolic ref to ${symbolic}; Forgeyard will not write through it`)
+    }
+    const result = await this.invoke(cwd, ['update-ref', '--no-deref', '--create-reflog', '--end-of-options', ref, commit, ''])
+    if (result.spawnError !== null || result.exitCode !== 0) {
+      const detail = result.spawnError ?? (result.stderr.text.trim() || `exit ${String(result.exitCode)}`)
+      throw new Error(`the Forgeyard promotion ref could not be created: ${detail}`)
+    }
   }
 
   /**

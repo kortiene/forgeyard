@@ -14,7 +14,7 @@ import type {
   TaskRecord,
 } from '../../packages/forgeyard/src/types.ts'
 import { canonicalJson, hashRecord, sha256 } from '../../packages/forgeyard/src/host/hash.ts'
-import { MIGRATION_001 } from '../../packages/forgeyard/src/host/migrations.ts'
+import { MIGRATION_001, MIGRATION_002, MIGRATIONS } from '../../packages/forgeyard/src/host/migrations.ts'
 import {
   assertAttemptRecordIntegrity,
   ForgeyardStore,
@@ -44,10 +44,17 @@ describe('Forgeyard SQLite authority migration and retry transaction', () => {
     return join(root, 'state', 'forgeyard.sqlite')
   }
 
-  it('keeps migration 001 immutable and upgrades an existing v1 database to authority schema 2', async () => {
+  it('keeps earlier migrations immutable and upgrades an existing v1 database to authority schema 3', async () => {
     const migrationFile = await readFile(join(import.meta.dirname, '../../packages/forgeyard/migrations/001_initial.sql'), 'utf8')
     expect(migrationFile).not.toContain('worktree_device')
     expect(MIGRATION_001).not.toContain('worktree_device')
+    // Milestone 2 is forward-only: promotion authority exists in migration 003
+    // alone and never edits the accepted Milestone 1 schema.
+    const hardening = await readFile(join(import.meta.dirname, '../../packages/forgeyard/migrations/002_authority_hardening.sql'), 'utf8')
+    expect(migrationFile).not.toContain('promotions')
+    expect(hardening).not.toContain('promotions')
+    expect(MIGRATION_001).not.toContain('promotions')
+    expect(MIGRATION_002).not.toContain('promotions')
 
     const path = await databasePath('upgrade')
     await mkdir(dirname(path), { recursive: true })
@@ -71,14 +78,74 @@ describe('Forgeyard SQLite authority migration and retry transaction', () => {
 
     const store = new ForgeyardStore(path)
     try {
-      expect((store.database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(2)
+      expect((store.database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(3)
       expect((store.database.prepare('SELECT version,name FROM schema_migrations ORDER BY version').all()))
-        .toEqual([{ version: 1, name: '001_initial' }, { version: 2, name: '002_authority_hardening' }])
+        .toEqual([
+          { version: 1, name: '001_initial' },
+          { version: 2, name: '002_authority_hardening' },
+          { version: 3, name: '003_local_promotion' },
+        ])
       const upgraded = store.attempt(attempt.id)
       expect(upgraded).toMatchObject({ worktreeDevice: null, rawWorkspaceBaseline: null, retryOfAttemptId: null })
       expect(() => assertAttemptRecordIntegrity(upgraded as AttemptRecord)).toThrow(/no durable worktree identity/u)
     } finally {
       store.close()
+    }
+  })
+
+  it('skips a migration another Host committed while this one was starting', async () => {
+    const path = await databasePath('concurrent-migration')
+    const first = new ForgeyardStore(path)
+    first.close()
+
+    // Reproduce the loser's exact durable state in a shared database: the
+    // winning Host applied and recorded 003 inside its write transaction, and
+    // this Host read `user_version` before that commit landed. Re-executing the
+    // migration on that stale read would fail this Host's whole startup.
+    const raw = new DatabaseSync(path)
+    raw.exec('PRAGMA user_version=2')
+    raw.close()
+
+    const second = new ForgeyardStore(path)
+    try {
+      expect((second.database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(3)
+      // Applied exactly once, by the Host that won the write transaction.
+      expect(second.database.prepare('SELECT version,name FROM schema_migrations ORDER BY version').all())
+        .toEqual([
+          { version: 1, name: '001_initial' },
+          { version: 2, name: '002_authority_hardening' },
+          { version: 3, name: '003_local_promotion' },
+        ])
+    } finally {
+      second.close()
+    }
+  })
+
+  it('keeps the Host migration mirror semantically identical to the checked-in SQL', async () => {
+    // The Host bundles its migrations as source strings for single-file
+    // packaging, so the checked-in .sql files could silently drift from what a
+    // real database is actually built with. Build both and compare schemas.
+    const fromFiles = new DatabaseSync(':memory:')
+    const fromMirror = new DatabaseSync(':memory:')
+    try {
+      for (const migration of MIGRATIONS) {
+        const file = join(
+          import.meta.dirname,
+          `../../packages/forgeyard/migrations/${migration.name}.sql`,
+        )
+        fromFiles.exec(await readFile(file, 'utf8'))
+        fromMirror.exec(migration.sql)
+      }
+      const schemaOf = (database: DatabaseSync): unknown[] =>
+        (database.prepare(
+          "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name",
+        ).all() as Array<Record<string, unknown>>)
+          .map(row => ({ ...row, sql: typeof row.sql === 'string' ? row.sql.replaceAll(/\s+/gu, '') : row.sql }))
+      expect(schemaOf(fromMirror)).toEqual(schemaOf(fromFiles))
+      expect(MIGRATIONS.map(migration => migration.version)).toEqual([1, 2, 3])
+    } finally {
+      fromFiles.close()
+      fromMirror.close()
     }
   })
 

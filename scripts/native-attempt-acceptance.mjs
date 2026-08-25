@@ -182,6 +182,69 @@ async function main() {
     }
     step(`APPROVE recorded for Attempt 2, bound to digest ${pass2.reviewDigest.slice(0, 16)}\u2026`)
 
+    // Milestone 2: the approved deliverable becomes a durable local Git output
+    // only through a separate, explicitly confirmed promotion.
+    if (approved.promotion?.status !== 'eligible' || approved.promotion?.eligible !== true
+      || approved.promotion?.reviewDigest !== pass2.reviewDigest || approved.promotions?.length !== 0) {
+      throw new Error(`APPROVE did not leave promotion separate and eligible: ${JSON.stringify(approved.promotion)}`)
+    }
+    const unconfirmed = await invokeRemote('promote', { request: {
+      attemptId: attempt2,
+      actor: 'native-acceptance',
+      rationale: 'A digest the operator never approved must never promote.',
+      expectedReviewDigest: '0'.repeat(64),
+    } })
+    if (unconfirmed?.ok !== false || unconfirmed.error?.code !== 'PROMOTION_BLOCKED') {
+      throw new Error(`Forgeyard promoted an unconfirmed review digest: ${JSON.stringify(unconfirmed)}`)
+    }
+    const promotedView = await remote('promote', { request: {
+      attemptId: attempt2,
+      actor: 'native-acceptance',
+      rationale: 'Promote exactly the approved Attempt 2 deliverable into a local Forgeyard ref.',
+      expectedReviewDigest: pass2.reviewDigest,
+    } })
+    const promotion = promotedView.promotions?.[0]
+    if (promotedView.promotions?.length !== 1 || promotion?.status !== 'promoted'
+      || promotion.reviewDigest !== pass2.reviewDigest
+      || promotion.decisionId !== approved.decisions.at(-1)?.id
+      || promotion.outputRef !== `refs/forgeyard/promotions/${attempt2}`) {
+      throw new Error(`promotion did not produce one bound durable record: ${JSON.stringify(promotedView.promotions)}`)
+    }
+    if (promotion.projection.promoted.count + promotion.projection.excluded.count
+      !== promotion.projection.manifestEntryCount) {
+      throw new Error(`the promotion projection did not classify every reviewed entry: ${JSON.stringify(promotion.projection)}`)
+    }
+    step(`PROMOTE: ${promotion.outputRef} at ${promotion.outputCommit.slice(0, 12)} (${promotion.projection.promoted.count} promoted, ${promotion.projection.excluded.count} excluded)`)
+
+    // The durable output must hold exactly the model-authored answer bytes and
+    // an untouched verification contract, read straight out of Git.
+    const promotedAnswer = await execFileAsync('git', ['cat-file', 'blob', `${promotion.outputCommit}:${ANSWER_PATH}`], { cwd: repository })
+    if (promotedAnswer.stdout !== EXPECTED_ANSWER) {
+      throw new Error(`the promoted commit does not carry ${ANSWER_PATH}=${JSON.stringify(EXPECTED_ANSWER)}: ${JSON.stringify(promotedAnswer.stdout)}`)
+    }
+    const promotedVerifier = await execFileAsync('git', ['cat-file', 'blob', `${promotion.outputCommit}:${VERIFIER_PATH}`], { cwd: repository })
+    const baseVerifier = await execFileAsync('git', ['cat-file', 'blob', `${approved.attempt.baseCommit}:${VERIFIER_PATH}`], { cwd: repository })
+    if (promotedVerifier.stdout !== baseVerifier.stdout) {
+      throw new Error('the promoted commit changed the verification contract')
+    }
+    const promotedTree = await execFileAsync('git', ['rev-parse', `${promotion.outputCommit}^{tree}`], { cwd: repository })
+    const promotedParents = await execFileAsync('git', ['rev-list', '--parents', '-n', '1', promotion.outputCommit], { cwd: repository })
+    if (promotedTree.stdout.trim() !== promotion.outputTree
+      || promotedParents.stdout.trim() !== `${promotion.outputCommit} ${promotion.baseCommit}`) {
+      throw new Error('the promoted commit is not the recorded tree on the exact Attempt base commit')
+    }
+    const repeated = await invokeRemote('promote', { request: {
+      attemptId: attempt2,
+      actor: 'native-acceptance',
+      rationale: 'Repeating a completed promotion must be refused with a stable explanation.',
+      expectedReviewDigest: pass2.reviewDigest,
+    } })
+    if (repeated?.ok !== false || repeated.error?.code !== 'PROMOTION_BLOCKED'
+      || !repeated.error.message.includes(promotion.outputCommit)) {
+      throw new Error(`Forgeyard repeated a completed promotion: ${JSON.stringify(repeated)}`)
+    }
+    step(`promoted commit holds ${ANSWER_PATH}=${JSON.stringify(EXPECTED_ANSWER)} with an untouched verifier; repeating it is refused`)
+
     // Attempt 1 must remain immutable after Attempt 2's terminal decision.
     const afterApprove = await remote('snapshot', {})
     const stillFrozen1 = afterApprove.missions[0]?.attempts.find((item) => item.attempt.id === attempt1)
@@ -197,10 +260,15 @@ async function main() {
     if (finalAnswer !== baseAnswer) throw new Error('the base checkout answer.txt changed during the Attempt')
     const status = await execFileAsync('git', ['status', '--porcelain=v2', '-z', '--untracked-files=all'], { cwd: repository })
     if (status.stdout !== '') throw new Error('the base checkout is dirty after the Attempt')
-    step('base checkout unchanged and clean')
+    const branches = await execFileAsync('git', ['for-each-ref', '--format=%(refname)', 'refs/heads/'], { cwd: repository })
+    if (branches.stdout.split('\n').filter(Boolean).length !== 1) {
+      throw new Error('promotion created or moved an operator branch instead of its own ref namespace')
+    }
+    step('base checkout unchanged and clean; promotion stayed inside refs/forgeyard/')
 
     process.stdout.write(`\nForgeyard native provider-driven acceptance PASSED (${steps.length} proofs).\n`)
     process.stdout.write(`  approved digest: ${pass2.reviewDigest}\n`)
+    process.stdout.write(`  promoted ref:    ${promotion.outputRef}\n  promoted commit: ${promotion.outputCommit}\n`)
     process.stdout.write(`  attempt 1 (immutable, retried): ${attempt1}\n  attempt 2 (approved):           ${attempt2}\n`)
   } finally {
     if (profile !== undefined) await profile.stop()

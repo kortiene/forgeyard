@@ -79,7 +79,7 @@ async function main() {
     // Setup only (NOT the round trip under test): seed one Mission + Attempt so a
     // native Session exists to select and open through the graphical UI.
     const emptySnapshot = await remote('snapshot', {})
-    if (emptySnapshot?.dshVersion !== '0.1.1-rc.2' || emptySnapshot?.schemaVersion !== 2) {
+    if (emptySnapshot?.dshVersion !== '0.1.1-rc.2' || emptySnapshot?.schemaVersion !== 3) {
       throw new Error(`unexpected initial Forgeyard snapshot: ${JSON.stringify(emptySnapshot)}`)
     }
     const mission = await remote('createMission', { request: {

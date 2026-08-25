@@ -1,6 +1,6 @@
 # DeepSeek Harness compatibility boundary
 
-Forgeyard Milestone 1 is audited against one exact DeepSeek Harness release:
+Forgeyard is audited against one exact DeepSeek Harness release:
 
 | Item | Pin |
 | --- | --- |
@@ -37,7 +37,7 @@ Every seam below is part of the pinned, published package surface. “Guard” n
 | Profile | `package.json#dsh.profile.bundles` | Compose base, Web app, then Forgeyard without forking DSH. | `tests/dsh-contract/packaging-contract.test.ts` |
 | Profile | `dshHomePath(...)` in a bundle patch | Place `forgeyard.sqlite` and managed worktrees under DSH home. | package/profile contract plus config dump inspection |
 | Host / Cordis | `Service`, `Service.init`, `Context` injection, `ctx.effect`, `ctx.logger` | Own one modular-monolith Host lifecycle and close SQLite with its fiber. | Host build and service lifecycle tests |
-| Host / Typert | `TypertRemoteService`, `@Remote(...)` | Export `snapshot`, `createMission`, `startAttempt`, `verifyAttempt`, `decide`, `retry`, and `attemptForSession`. | generated endpoint assertions in `packaging-contract.test.ts` |
+| Host / Typert | `TypertRemoteService`, `@Remote(...)` | Export `snapshot`, `createMission`, `startAttempt`, `verifyAttempt`, `decide`, `retry`, `promote`, and `attemptForSession`. | generated endpoint assertions in `packaging-contract.test.ts` |
 | Host / API Proxy | `ctx.apiProxy.agentPresets.list(...)` | Resolve and validate the effective DSH agent preset before freezing an Attempt. | `tests/dsh-contract/host-contract.test.ts` |
 | Host / presets | `ctx.agentPresets.standingKeyFor(id)` | Resolve the public scope key for the exact preset whose tools are frozen. | declaration and behavior assertions in `host-contract.test.ts` |
 | Host / tools | `ctx.tools.schemas(scope)`, `agent.ctx.tools.guard(...)` | Hash the sorted visible tool schemas and monotonically deny unlisted/drifted tools on the live Agent. | schema/guard drift assertions in `host-contract.test.ts` |
@@ -54,7 +54,7 @@ Every seam below is part of the pinned, published package surface. “Guard” n
 | Host / sandbox | `ctx.sandbox.confine(argv, policy)`, `ConfinedArgv.enforcement` | Wrap the exact verifier argv and refuse execution unless the provider reports full enforcement. | full/partial enforcement assertions in `host-contract.test.ts` |
 | Host / API Proxy | `ctx.apiProxy.sessions.selectModel(...)` | Apply and confirm the frozen provider, model, and optional reasoning effort. | `tests/dsh-contract/host-contract.test.ts` |
 | Host / API Proxy | `ctx.apiProxy.sessions.prompt(...)` | Queue the immutable Attempt instruction in the native Session. | `tests/dsh-contract/host-contract.test.ts` |
-| Host / subprocess | `ctx.subprocess.spawn(spec)` and its managed handle | Run Git and the sandbox-wrapped verifier argv without a shell, with deadlines, maintenance cancellation, and bounded/spilled collection. | managed-process and abort-propagation tests in `host-contract.test.ts` |
+| Host / subprocess | `ctx.subprocess.spawn(spec)` and its managed handle | Run Git and the sandbox-wrapped verifier argv without a shell, with deadlines, maintenance cancellation, and bounded/spilled collection. Promotion uses the same seam for its scratch-index Git plumbing. | managed-process and abort-propagation tests in `host-contract.test.ts` |
 | Client / Remote | `ctx.remote.$mount(contribution)` and generated `ctx.remote.forgeyard.*` | Mount the generated Typert client and call the Host-authoritative domain service. | build output and generated endpoint contract |
 | Client / slots | `ctx.slots.inject(...)`, `ctx.slots.register(...)` | Add contributions only for the lifetime of their owning DSH seats. | `tests/dsh-contract/client-contract.test.ts` |
 | Client / slots | `sidebar.footer.action` | Open the Cockpit from the native sidebar. | exact-name and lifetime assertions in `client-contract.test.ts` |
@@ -104,6 +104,21 @@ Only a `ConfinedArgv` with `enforcement: 'full'` is spawned through `ctx.subproc
 Forgeyard rejects filters, attributes, include-based local configuration, index-hiding/sparse flags, replace refs, object alternates, and gitlinks before trusting Git's interpretation of the worktree. Its fingerprint combines tracked differences with a persisted root-inclusive raw manifest covering all directory/file/symlink content and review-relevant metadata, including ignored files and empty directories.
 
 Any collector-output or review-diff truncation marks Evidence `INCOMPLETE`; retained hashes and previews remain diagnostic but cannot authorize approval.
+
+### Promotion uses no DSH seam at all
+
+Promotion is a Forgeyard-owned boundary over SQLite, the filesystem, and Git.
+It deliberately does not resolve, resume, or claim maintenance on the Attempt's
+Session. The terminal Decision already cancelled that Agent, drained its
+continuable descendants and owner-scoped Jobs, and installed the global
+`agent/pre-step` rejection, so a second maintenance claim would resume a sealed
+Session rather than fence anything. The only DSH surface promotion touches is
+`ctx.subprocess`, already listed above, for its Git plumbing.
+
+This keeps the new capability outside the rc.2 compatibility surface: an upgrade
+that changes Session, Agent, or maintenance semantics cannot silently change
+what a promotion delivers. See
+[ADR-0004](adr/0004-local-promotion-boundary.md).
 
 ### Client navigation is exact and fail-closed
 

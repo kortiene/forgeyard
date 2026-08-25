@@ -6,7 +6,13 @@ import React, { act, useSyncExternalStore, type ComponentType } from 'react'
 import * as JsxRuntime from 'react/jsx-runtime'
 import { createRoot, type Root } from 'react-dom/client'
 import { describe, expect, it, vi } from 'vitest'
-import type { ForgeyardSnapshot } from '../../packages/forgeyard/src/types.ts'
+import type {
+  AttemptView,
+  ForgeyardSnapshot,
+  PromotionEligibility,
+  PromotionProjection,
+  PromotionRecord,
+} from '../../packages/forgeyard/src/types.ts'
 
 interface SlotEntry {
   options: {
@@ -103,6 +109,129 @@ describe('built Forgeyard browser face', () => {
     await footer.unmount()
     for (const cleanup of cleanups.reverse()) cleanup()
   })
+
+  it('renders promotion eligibility, requires explicit confirmation, and shows the durable result', async () => {
+    const client = await executeBuiltClientFace()
+    const entries = new Map<string, SlotEntry>()
+    const cleanups: Array<() => void> = []
+    const digest = '9'.repeat(64)
+    const promote = vi.fn()
+    const eligible = snapshotFixture()
+    const attemptView = requiredAttempt(eligible.missions[0]?.attempts)
+    attemptView.attempt.state = 'approved'
+    attemptView.decisions = [{
+      id: 'decision-1', attemptId: 'attempt-1', type: 'APPROVE', reviewDigest: digest,
+      actor: 'operator', rationale: 'Trusted verification passed.', createdAt: 1,
+    }]
+    attemptView.promotion = {
+      status: 'eligible', eligible: true, reason: null, reviewDigest: digest, decisionId: 'decision-1',
+      plannedRef: 'refs/forgeyard/promotions/attempt-1', promotionId: null,
+      outputRef: null, outputCommit: null, failureReason: null,
+    }
+    const result = <T,>(value: T) => Promise.resolve({ ok: true, value: { ok: true, value } })
+    const ctx = fakeClientContext(entries, cleanups, eligible, result, { promote })
+
+    await act(async () => { await client.apply(ctx as never) })
+    const overlay = await mount(<Slot entry={required(entries, 'shell.overlay')} />)
+    const footer = await mount(<Slot entry={required(entries, 'sidebar.footer.action')} runtime={{ wide: true }} />)
+    await click(await waitForElement(() => namedButton(footer.container, /Open Forgeyard/u)))
+    await waitForElement(() => overlay.container.querySelector('[role="dialog"]'))
+    await click(requiredElement(namedButton(overlay.container, /Browser mission/u), 'mission button'))
+    await click(requiredElement(overlay.container.querySelector<HTMLButtonElement>('[role="row"]'), 'attempt row'))
+
+    const panel = requiredElement(
+      overlay.container.querySelector<HTMLElement>('[data-promotion-status]'),
+      'promotion panel',
+    )
+    expect(panel.dataset.promotionStatus).toBe('eligible')
+    expect(panel.textContent).toContain(digest)
+    expect(panel.textContent).toContain('refs/forgeyard/promotions/attempt-1')
+    expect(panel.textContent).toContain('Not promoted')
+
+    // Approval alone never promotes: the operator must open and confirm.
+    expect(promote).not.toHaveBeenCalled()
+    expect(namedButton(panel, /Confirm promotion/u)).toBeNull()
+    await click(requiredElement(namedButton(panel, /Promote approved deliverable/u), 'promote button'))
+    const confirm = requiredElement(namedButton(panel, /Confirm promotion/u), 'confirm button')
+    // Confirmation is not a bare button press: the operator must supply a
+    // rationale, and the request carries the exact digest the panel displayed.
+    expect(confirm.disabled).toBe(true)
+    await click(confirm)
+    expect(promote).not.toHaveBeenCalled()
+    await type(requiredElement(panel.querySelector<HTMLTextAreaElement>('textarea'), 'rationale field'),
+      'Deliver the reviewed change locally.')
+    await click(requiredElement(namedButton(panel, /Confirm promotion/u), 'confirm button'))
+    expect(promote).toHaveBeenCalledWith({
+      attemptId: 'attempt-1',
+      actor: 'local-user',
+      rationale: 'Deliver the reviewed change locally.',
+      expectedReviewDigest: digest,
+    })
+
+    await footer.unmount()
+    await overlay.unmount()
+    for (const cleanup of cleanups.reverse()) cleanup()
+  })
+
+  it('renders a completed promotion, its earlier failure, and the reason it cannot repeat', async () => {
+    const client = await executeBuiltClientFace()
+    const entries = new Map<string, SlotEntry>()
+    const cleanups: Array<() => void> = []
+    const digest = '9'.repeat(64)
+    const commit = '7'.repeat(40)
+    const data = snapshotFixture()
+    const attemptView = requiredAttempt(data.missions[0]?.attempts)
+    attemptView.attempt.state = 'approved'
+    attemptView.promotions = [
+      {
+        ...promotionRecordFixture(digest, commit),
+        id: 'promotion-0',
+        status: 'failed',
+        failureReason: 'The Forgeyard promotion ref was not created: reference already exists',
+        outputCommit: '6'.repeat(40),
+      },
+      promotionRecordFixture(digest, commit),
+    ]
+    attemptView.promotion = {
+      status: 'promoted', eligible: false,
+      reason: `This Attempt was already promoted to refs/forgeyard/promotions/attempt-1 at ${commit}.`,
+      reviewDigest: digest, decisionId: 'decision-1',
+      plannedRef: 'refs/forgeyard/promotions/attempt-1', promotionId: 'promotion-1',
+      outputRef: 'refs/forgeyard/promotions/attempt-1', outputCommit: commit,
+      failureReason: null,
+    } satisfies PromotionEligibility
+    const result = <T,>(value: T) => Promise.resolve({ ok: true, value: { ok: true, value } })
+    const ctx = fakeClientContext(entries, cleanups, data, result, { promote: vi.fn() })
+
+    await act(async () => { await client.apply(ctx as never) })
+    const overlay = await mount(<Slot entry={required(entries, 'shell.overlay')} />)
+    const footer = await mount(<Slot entry={required(entries, 'sidebar.footer.action')} runtime={{ wide: true }} />)
+    await click(await waitForElement(() => namedButton(footer.container, /Open Forgeyard/u)))
+    await waitForElement(() => overlay.container.querySelector('[role="dialog"]'))
+    await click(requiredElement(namedButton(overlay.container, /Browser mission/u), 'mission button'))
+    await click(requiredElement(overlay.container.querySelector<HTMLButtonElement>('[role="row"]'), 'attempt row'))
+
+    const panel = requiredElement(
+      overlay.container.querySelector<HTMLElement>('[data-promotion-status]'),
+      'promotion panel',
+    )
+    expect(panel.dataset.promotionStatus).toBe('promoted')
+    expect(panel.textContent).toContain('already promoted')
+    expect(panel.textContent).toContain(commit)
+    expect(panel.textContent).toContain('2 promoted')
+    expect(panel.textContent).toContain('1 ignored')
+    expect(panel.textContent).toContain('1 dropped directories')
+    // The earlier failure stays visible and readable next to the durable result.
+    expect(panel.textContent).toContain('reference already exists')
+    expect(panel.querySelectorAll('.fy-check')).toHaveLength(2)
+    // A completed promotion never offers the action again.
+    expect(namedButton(panel, /Promote approved deliverable/u)).toBeNull()
+    expect(namedButton(panel, /Confirm promotion/u)).toBeNull()
+
+    await footer.unmount()
+    await overlay.unmount()
+    for (const cleanup of cleanups.reverse()) cleanup()
+  })
 })
 
 function Slot({
@@ -151,6 +280,16 @@ async function click(button: HTMLButtonElement): Promise<void> {
   await act(async () => { button.click() })
 }
 
+async function type(field: HTMLTextAreaElement | HTMLInputElement, value: string): Promise<void> {
+  const prototype = field instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype
+  const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set
+  if (setter === undefined) throw new Error('the browser value setter is unavailable')
+  await act(async () => {
+    setter.call(field, value)
+    field.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+}
+
 async function waitForElement<T extends Element>(read: () => T | null): Promise<T> {
   for (let index = 0; index < 50; index += 1) {
     const value = read()
@@ -196,6 +335,113 @@ async function executeBuiltClientFace(): Promise<BrowserFace> {
   }
 }
 
+function requiredAttempt(attempts: AttemptView[] | undefined): AttemptView {
+  const attempt = attempts?.[0]
+  if (attempt === undefined) throw new Error('missing attempt fixture')
+  return attempt
+}
+
+function fakeClientContext(
+  entries: Map<string, SlotEntry>,
+  cleanups: Array<() => void>,
+  data: ForgeyardSnapshot,
+  result: <T>(value: T) => Promise<{ ok: true; value: { ok: true; value: T } }>,
+  overrides: Record<string, unknown>,
+): Record<string, unknown> {
+  const ctx: Record<string, unknown> = {
+    remote: {
+      $mount: vi.fn(async () => undefined),
+      forgeyard: {
+        snapshot: vi.fn(() => result(data)),
+        createMission: vi.fn(), startAttempt: vi.fn(), verifyAttempt: vi.fn(), decide: vi.fn(), retry: vi.fn(),
+        promote: vi.fn(),
+        attemptForSession: vi.fn(() => result(null)),
+        ...overrides,
+      },
+    },
+    sessions: {
+      list: {
+        getSnapshot: () => ({ ids: ['session-1'], byId: { 'session-1': { id: 'session-1' } } }),
+        subscribe: () => () => undefined,
+      },
+      open: vi.fn(),
+    },
+    effect: (install: () => (() => void)) => { cleanups.push(install()) },
+    plugin: (definition: { apply: (scope: unknown) => void | Promise<void> }) => { void definition.apply(ctx) },
+    slots: {
+      inject: (_name: string, install: () => void) => { install() },
+      register: (options: SlotEntry['options'], component: SlotEntry['component']) => {
+        entries.set(options.name, { options, component })
+        return () => { entries.delete(options.name) }
+      },
+    },
+  }
+  return ctx
+}
+
+function promotionRecordFixture(reviewDigest: string, outputCommit: string): PromotionRecord {
+  const projection: PromotionProjection = {
+    version: 1,
+    projector: 'forgeyard.promotion-projection',
+    projectorVersion: '1.0.0',
+    workspaceHash: '1'.repeat(64),
+    manifestEntryCount: 5,
+    promoted: {
+      count: 2,
+      hash: '2'.repeat(64),
+      preview: [{
+        path: 'result.txt', type: 'file', gitMode: '100644', mode: '33188',
+        sizeBytes: '6', contentHash: '3'.repeat(64), blobOid: '4'.repeat(40),
+      }],
+      previewTruncated: false,
+    },
+    excluded: {
+      count: 3,
+      hash: '5'.repeat(64),
+      preview: [
+        { path: '.git', type: 'file', reason: 'git-admin' },
+        { path: 'debug.log', type: 'file', reason: 'ignored' },
+        { path: 'build', type: 'directory', reason: 'directory-dropped' },
+      ],
+      previewTruncated: false,
+    },
+    excludedByReason: [
+      { reason: 'git-admin', count: 1, hash: '6'.repeat(64) },
+      { reason: 'ignored', count: 1, hash: '7'.repeat(64) },
+      { reason: 'directory-implied', count: 0, hash: '8'.repeat(64) },
+      { reason: 'directory-dropped', count: 1, hash: '9'.repeat(64) },
+    ],
+    unrepresentableModes: { count: 0, hash: 'a'.repeat(64), preview: [], previewTruncated: false },
+    notCarried: ['Git-ignored files and directories'],
+    canonical: '{}',
+    hash: 'b'.repeat(64),
+  }
+  return {
+    id: 'promotion-1',
+    attemptId: 'attempt-1',
+    decisionId: 'decision-1',
+    reviewDigest,
+    executionSnapshotHash: 'e'.repeat(64),
+    baseCommit: 'a'.repeat(40),
+    worktreeHead: 'a'.repeat(40),
+    evidenceDigest: 'c'.repeat(64),
+    verificationDigest: 'd'.repeat(64),
+    projection,
+    projectionHash: projection.hash,
+    objectFormat: 'sha1',
+    outputRef: 'refs/forgeyard/promotions/attempt-1',
+    outputCommit,
+    outputTree: '5'.repeat(40),
+    status: 'promoted',
+    actor: 'operator',
+    rationale: 'Promote the approved deliverable.',
+    failureReason: null,
+    hash: 'f'.repeat(64),
+    createdAt: 2,
+    settledAt: 3,
+  }
+}
+
 function required(entries: Map<string, SlotEntry>, name: string): SlotEntry {
   const entry = entries.get(name)
   if (entry === undefined) throw new Error(`missing slot entry ${name}`)
@@ -215,7 +461,7 @@ function snapshotFixture(): ForgeyardSnapshot {
   }
   const requirement = { key: 'verify-1', command: 'node verify.mjs', argv: ['node', 'verify.mjs'] }
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     dshVersion: '0.1.1-rc.2',
     missions: [{
       mission: {
@@ -247,7 +493,13 @@ function snapshotFixture(): ForgeyardSnapshot {
         review: {
           reviewDigest: 'f'.repeat(64), liveGitFingerprint: 'unavailable', latestRunId: null,
           requiredVerificationCount: 1, passingVerificationCount: 0, canApprove: false,
-          approvalStale: true, reason: 'No trusted Evidence has been collected.',
+          reviewedStateCurrent: false, approvalStale: true, reason: 'No trusted Evidence has been collected.',
+        },
+        promotions: [],
+        promotion: {
+          status: 'blocked', eligible: false, plannedRef: null, promotionId: null,
+          reason: 'Only an Attempt with a terminal APPROVE Decision can be promoted; this Attempt is awaiting_decision.',
+          reviewDigest: null, decisionId: null, outputRef: null, outputCommit: null, failureReason: null,
         },
       }],
       derivedState: 'awaiting_decision',

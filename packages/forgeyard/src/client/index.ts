@@ -11,6 +11,7 @@ import type {
   ForgeyardSnapshot,
   MissionCreateRequest,
   MissionView,
+  PromoteRequest,
   RetryRequest,
   TaskId,
 } from '../types.ts'
@@ -55,6 +56,8 @@ function remoteApi(ctx: ClientContext): ForgeyardClientApi {
       unwrap<AttemptView>(ctx.remote.forgeyard.decide(request)),
     retry: (request: RetryRequest) =>
       unwrap<AttemptView>(ctx.remote.forgeyard.retry(request)),
+    promote: (request: PromoteRequest) =>
+      unwrap<AttemptView>(ctx.remote.forgeyard.promote(request)),
     attemptForSession: (sessionId: string) =>
       unwrap<AttemptSessionRef | null>(ctx.remote.forgeyard.attemptForSession(sessionId)),
   }

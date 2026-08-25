@@ -63,7 +63,7 @@ with `TMPDIR` pointed into it:
 
 ```sh
 MP=$(node scripts/provision-case-sensitive.mjs mount gate)
-TMPDIR="$MP/tmp" pnpm check          # build + 54 tests + profile smoke
+TMPDIR="$MP/tmp" pnpm check          # build + the full test suite + profile smoke
 TMPDIR="$MP/tmp" pnpm smoke:browser  # assembled-browser round trip
 TMPDIR="$MP/tmp" pnpm smoke:native   # native provider-driven Attempt
 node scripts/provision-case-sensitive.mjs unmount "$MP"
@@ -115,6 +115,14 @@ Decision, successor link, unchanged Evidence) → Attempt 2 on a **new Session a
 worktree** → native execution → `PASS` → `APPROVE` bound to Attempt 2's exact
 digest, with Attempt 1 still immutable afterward and the base checkout unchanged
 and clean.
+
+The same harness then carries the Milestone 2 proof: approval leaves the Attempt
+eligible but undelivered, an unconfirmed digest is refused, one explicit
+promotion writes `refs/forgeyard/promotions/<attemptId>`, the promoted commit is
+read straight back out of Git and must hold exactly `answer.txt=42\n` with an
+untouched `verify.mjs` on the exact Attempt base commit, repeating the promotion
+is refused, and no operator branch moved. See
+[the Milestone 2 runbook](milestone-2-acceptance.md).
 
 **Why `RETRY` precedes the terminal `APPROVE`.** Forgeyard's SQLite authority
 enforces exactly one terminal Decision per Attempt, and `retry` only accepts a
