@@ -5,6 +5,7 @@ badge imply an assurance nobody actually obtained.
 
 | Gate | Runs in CI | Requires a provider credential | Requires an operator host capability |
 | --- | --- | --- | --- |
+| `pnpm check:scripts` (recursive MJS parse check) | yes | no | no |
 | `pnpm build` | yes | no | no |
 | `pnpm test` (full Vitest suite) | yes | no | no |
 | `pnpm smoke:profile` | yes | no | no |
@@ -28,21 +29,30 @@ A green `safety-gate` establishes that, for the exact reviewed commit:
    [DSH compatibility](dsh-compatibility.md)). `--frozen-lockfile` fails rather
    than silently resolving a different dependency graph, so a PR cannot drift
    the pinned `0.1.1-rc.2` DSH surface without the gate noticing.
-2. **The dual-face package builds.** Host types compile, the Typert Host and
+2. **Every repository MJS harness parses.** `pnpm check:scripts`
+   recursively discovers every regular `*.mjs` file under `scripts/` in a
+   deterministic order and runs the exact active Node binary with `--check` on
+   each one. This includes provider-credentialed operator harnesses that CI does
+   not execute, so a syntax error cannot hide behind a green build/test/profile
+   gate. It fails rather than passing an empty or unreadable scripts root.
+3. **The dual-face package builds.** Host types compile, the Typert Host and
    browser Remote artifacts generate, and the static Web client face emits.
-3. **The full vitest suite passes** — DSH contract, real-Git authority, and the
+4. **The full vitest suite passes** — DSH contract, real-Git authority, and the
    vertical slices through Decision, Retry, and promotion.
-4. **The real pinned DSH Web profile boots and serves the assembled
+5. **The real pinned DSH Web profile boots and serves the assembled
    application**, the Forgeyard Host face loads, the generated Typert Remotes
    answer, and two native Attempts run in distinct Sessions and isolated
    worktrees through trusted Evidence, Verification, `RETRY`, and a terminal
    Decision — with the base checkout proven clean and unmoved and the Host
    schema proven to be exactly the eight expected tables at `user_version = 3`.
 
-This was verified before the workflow was proposed, by reproducing the gate from
-a **clean clone** in a hermetic environment with an empty `HOME`, **no**
-`.credentials.yaml`, no inherited `DSH_*` variables, and no global Git identity.
-It passed on both Node legs. CI therefore does not depend on operator state.
+The original build/test/profile portions were verified before the workflow was
+proposed by reproducing them from a **clean clone** in a hermetic environment
+with an empty `HOME`, **no** `.credentials.yaml`, no inherited `DSH_*`
+variables, and no global Git identity. They passed on both Node legs. The MJS
+syntax step is likewise credential-free and is covered by focused CLI-boundary
+regressions on both supported Node lines. CI therefore does not depend on
+operator state.
 
 ### Why the smoke run is honest either way
 
@@ -77,6 +87,12 @@ drops Landlock, the gate stays honest by asserting the fail-closed branch
 instead.
 
 ## What CI does not prove
+
+Parsing a harness is not loading or executing it. A green `check:scripts`
+proves that `smoke:browser` and `smoke:native` are syntactically valid for
+the supported Node runtime; it does **not** resolve their imports or claim their
+provider-, browser-, or sandbox-driven
+acceptance behavior ran. They remain the manual gates below.
 
 ### `smoke:native` cannot be a credential-free required check
 

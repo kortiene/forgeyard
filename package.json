@@ -10,6 +10,7 @@
   },
   "scripts": {
     "clean": "node scripts/clean.mjs",
+    "check:scripts": "node scripts/check-mjs-syntax.mjs",
     "build:types:host": "tsc -b tsconfig.host.json",
     "build:host": "pnpm run build:types:host && node scripts/generate-typert.mjs && node scripts/build-face.mjs host",
     "build:types:client": "tsc -b tsconfig.client.json",
@@ -23,7 +24,7 @@
     "smoke:profile": "node scripts/profile-smoke.mjs",
     "smoke:browser": "node scripts/browser-roundtrip.mjs",
     "smoke:native": "node scripts/native-attempt-acceptance.mjs",
-    "check": "pnpm run build && pnpm run test && pnpm run smoke:profile"
+    "check": "pnpm run check:scripts && pnpm run build && pnpm run test && pnpm run smoke:profile"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.1",
