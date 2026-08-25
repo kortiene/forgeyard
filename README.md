@@ -170,6 +170,12 @@ pnpm smoke:profile
 
 Test results are environment-specific. Do not infer a pass from the presence of a test or build artifact.
 
+## Continuous integration
+
+The [`safety-gate` workflow](.github/workflows/safety-gate.yml) runs `pnpm check` — the same reproducible gate documented above — on both legs of the supported engines range, installing with `pnpm install --frozen-lockfile` and the Corepack-activated pinned pnpm. It needs no provider credential.
+
+`smoke:browser` and `smoke:native` are **not** run in CI: both hard-require a real operator DSH provider credential, so neither can be a credential-free required check. They remain operator acceptance gates, and a green CI run never implies either of them ran. See [CI and acceptance gates](docs/ci.md) for exactly what CI proves and what it does not.
+
 ## Repository layout
 
 - `packages/forgeyard/src/host/` — the one Host service, SQLite store, execution adapter, Git authority, and trusted collectors;
