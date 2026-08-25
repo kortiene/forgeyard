@@ -380,9 +380,14 @@ export class ForgeyardStore {
     return row === undefined ? undefined : taskOf(row)
   }
 
-  taskForMission(missionId: MissionId): TaskRecord | undefined {
-    const row = this.database.prepare('SELECT * FROM tasks WHERE mission_id=? ORDER BY created_at,id LIMIT 1').get(missionId) as Row | undefined
-    return row === undefined ? undefined : taskOf(row)
+  /**
+   * Every Task of a Mission. The query order is deterministic for recovery,
+   * but the engine reorders these records by the frozen Pipe node list before
+   * exposing them: insertion time and random IDs never define product order.
+   */
+  tasksForMission(missionId: MissionId): TaskRecord[] {
+    const rows = this.database.prepare('SELECT * FROM tasks WHERE mission_id=? ORDER BY created_at,id').all(missionId) as Row[]
+    return rows.map(taskOf)
   }
 
   createAttempt(attempt: AttemptRecord): void {

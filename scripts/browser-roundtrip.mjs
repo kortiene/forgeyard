@@ -95,7 +95,7 @@ async function main() {
       agentPreset: null,
       permissionPreset: null,
     } })
-    const running = await remote('startAttempt', { taskId: mission.task.id })
+    const running = await remote('startAttempt', { taskId: mission.tasks[0].task.id })
     const attemptId = running.attempt.id
     const sessionId = running.attempt.dshSessionId
     const worktreePath = running.attempt.worktreePath
@@ -135,6 +135,7 @@ async function main() {
       { description: 'mission card selectable' },
     )
     await page.waitFor('[...document.querySelectorAll(".fy-header-view span")].some(s=>s.textContent==="Mission detail")', { description: 'mission detail view' })
+    await page.waitFor('!!document.querySelector(\'article[aria-label="Task node implement"]\')', { description: 'explicit Mission Task node' })
     await page.waitFor(
       '(() => { const r=document.querySelector(\'button[role="row"].fy-attempt-row\'); if(!r) return false; r.click(); return true; })()',
       { description: 'attempt row selectable' },

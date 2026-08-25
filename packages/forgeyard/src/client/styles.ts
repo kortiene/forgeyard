@@ -123,6 +123,16 @@ export const FORGEYARD_CSS = String.raw`
 .fy-fact strong, .fy-fact code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
 .fy-section { margin-top: 18px; padding: 18px; border: 1px solid var(--fy-line); border-radius: 14px; background: rgba(255, 254, 249, .7); }
 .fy-section-title { align-items: center; margin-bottom: 15px; }
+.fy-node-list { display: grid; gap: 12px; }
+.fy-node-card { display: grid; gap: 13px; padding: 16px; border: 1px solid var(--fy-line); border-radius: 12px; background: var(--fy-panel); }
+.fy-node-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.fy-node-header h3 { margin-top: 5px; font-size: 15px; }
+.fy-node-header > div:first-child > p:last-child { max-width: 680px; margin-top: 6px; color: var(--fy-muted); font-size: 11px; line-height: 1.5; }
+.fy-node-statuses { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.fy-node-statuses > span { display: inline-flex; align-items: center; gap: 6px; color: var(--fy-muted); font-size: 9px; font-weight: 700; text-transform: uppercase; }
+.fy-node-meta { display: flex; flex-wrap: wrap; gap: 12px; color: var(--fy-muted); font-size: 10px; }
+.fy-node-reason { padding: 9px 11px; border-left: 3px solid var(--fy-amber); background: #fff9ec; color: #72521b; font-size: 10px; line-height: 1.5; }
+.fy-node-actions { display: flex; justify-content: flex-end; }
 .fy-table, .fy-check-list, .fy-evidence-list { display: grid; gap: 7px; }
 .fy-attempt-row {
   display: grid; grid-template-columns: 42px minmax(120px, 1fr) auto auto 20px; align-items: center; gap: 12px;
@@ -192,7 +202,9 @@ export const FORGEYARD_CSS = String.raw`
   .fy-view { width: min(100% - 24px, 1160px); padding-top: 22px; }
   .fy-brand small { display: none; }
   .fy-card-grid, .fy-facts, .fy-summary-stats, .fy-review-summary .fy-summary-stats { grid-template-columns: 1fr; }
-  .fy-detail-hero { align-items: flex-start; flex-direction: column; }
+  .fy-detail-hero, .fy-node-header { align-items: flex-start; flex-direction: column; }
+  .fy-node-statuses { justify-content: flex-start; }
+  .fy-node-actions .fy-primary { width: 100%; }
   .fy-attempt-row { grid-template-columns: 34px minmax(100px, 1fr) auto; }
   .fy-attempt-row > :nth-child(4), .fy-attempt-row > :nth-child(5) { display: none; }
   .fy-form-row { grid-template-columns: 1fr; }

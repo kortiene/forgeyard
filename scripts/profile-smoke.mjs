@@ -129,7 +129,15 @@ try {
     agentPreset: null,
     permissionPreset: null,
   } })
-  const running = await remote('startAttempt', { taskId: mission.task.id })
+  const node = mission.tasks?.[0]
+  if (mission.tasks?.length !== 1 || node?.task?.sourceNodeKey !== 'implement'
+    || node.readiness?.status !== 'ready' || node.readiness?.startable !== true
+    || node.nodeState !== 'ready' || mission.derivedState !== 'ready'
+    || node.attempts?.length !== 0 || mission.mission?.pipe?.nodes?.[0]?.dependsOn?.length !== 0
+    || 'task' in mission || 'attempts' in mission) {
+    throw new Error(`Forgeyard did not expose the one-node Mission through the plural API: ${JSON.stringify(mission)}`)
+  }
+  const running = await remote('startAttempt', { taskId: node.task.id })
   if (running?.attempt?.state !== 'running' || running.attempt.ordinal !== 1
     || typeof running.attempt.dshSessionId !== 'string' || running.attempt.dshSessionId.length === 0
     || running.attempt.worktreePath.startsWith(repository)
@@ -138,8 +146,12 @@ try {
     throw new Error(`Forgeyard did not bind one native isolated Attempt: ${JSON.stringify(running?.attempt)}`)
   }
   const populatedSnapshot = await remote('snapshot', {})
-  if (populatedSnapshot.missions?.[0]?.attempts?.[0]?.attempt?.dshSessionId !== running.attempt.dshSessionId) {
-    throw new Error('Forgeyard snapshot did not retain the exact native DSH Session association')
+  const populatedMission = populatedSnapshot.missions?.[0]
+  if (populatedMission?.tasks?.[0]?.attempts?.[0]?.attempt?.dshSessionId !== running.attempt.dshSessionId
+    || populatedMission.tasks[0].readiness?.startable !== false
+    || populatedMission.tasks[0].nodeState !== 'running'
+    || populatedMission.derivedState !== 'running') {
+    throw new Error(`Forgeyard snapshot did not retain the node-owned native Session association: ${JSON.stringify(populatedMission)}`)
   }
 
   // Prompt admission is intentionally not treated as completion. Poll the
@@ -181,7 +193,7 @@ try {
     throw new Error(`Forgeyard real-profile Retry did not create new authority: ${JSON.stringify(retry)}`)
   }
   const afterRetry = await remote('snapshot', {})
-  const frozenFirst = afterRetry.missions?.[0]?.attempts?.find(item => item.attempt?.id === running.attempt.id)
+  const frozenFirst = afterRetry.missions?.[0]?.tasks?.[0]?.attempts?.find(item => item.attempt?.id === running.attempt.id)
   if (frozenFirst?.attempt?.state !== 'retried' || frozenFirst?.attempt?.successorAttemptId !== retry.attempt.id
     || frozenFirst.decisions?.[0]?.type !== 'RETRY') {
     throw new Error(`Forgeyard did not retain immutable Attempt 1 Retry authority: ${JSON.stringify(frozenFirst)}`)

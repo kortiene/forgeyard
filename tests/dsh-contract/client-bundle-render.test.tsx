@@ -86,6 +86,10 @@ describe('built Forgeyard browser face', () => {
     expect(overlay.container.querySelectorAll('style[data-plugin-css="forgeyard/client"]')).toHaveLength(1)
 
     await click(requiredElement(namedButton(overlay.container, /Browser mission/u), 'mission button'))
+    expect(heading(overlay.container, 'Task nodes')).not.toBeNull()
+    expect(overlay.container.querySelector('article[aria-label="Task node implement"]')).not.toBeNull()
+    expect(overlay.container.textContent).toContain('Readiness Ready')
+    expect(overlay.container.textContent).toContain('Attempt Awaiting Decision')
     await click(requiredElement(overlay.container.querySelector<HTMLButtonElement>('[role="row"]'), 'attempt row'))
     expect(heading(overlay.container, 'Attempt review')).not.toBeNull()
     await click(requiredElement(namedButton(overlay.container, /Open Session/u), 'session button'))
@@ -117,8 +121,7 @@ describe('built Forgeyard browser face', () => {
     const digest = '9'.repeat(64)
     const promote = vi.fn()
     const eligible = snapshotFixture()
-    const attemptView = requiredAttempt(eligible.missions[0]?.attempts)
-    attemptView.attempt.state = 'approved'
+    const attemptView = approveMissionFixture(eligible)
     attemptView.decisions = [{
       id: 'decision-1', attemptId: 'attempt-1', type: 'APPROVE', reviewDigest: digest,
       actor: 'operator', rationale: 'Trusted verification passed.', createdAt: 1,
@@ -180,8 +183,7 @@ describe('built Forgeyard browser face', () => {
     const digest = '9'.repeat(64)
     const commit = '7'.repeat(40)
     const data = snapshotFixture()
-    const attemptView = requiredAttempt(data.missions[0]?.attempts)
-    attemptView.attempt.state = 'approved'
+    const attemptView = approveMissionFixture(data)
     attemptView.promotions = [
       {
         ...promotionRecordFixture(digest, commit),
@@ -341,6 +343,26 @@ function requiredAttempt(attempts: AttemptView[] | undefined): AttemptView {
   return attempt
 }
 
+/** Keep the Attempt, node projection, and Mission rollup mutually consistent. */
+function approveMissionFixture(data: ForgeyardSnapshot): AttemptView {
+  const mission = data.missions[0]
+  const node = mission?.tasks[0]
+  const attempt = requiredAttempt(node?.attempts)
+  if (mission === undefined || node === undefined) throw new Error('missing Mission node fixture')
+  attempt.attempt.state = 'approved'
+  node.nodeState = 'approved'
+  node.readiness = {
+    status: 'ready',
+    startable: false,
+    reason: 'This Task is approved; starting another initial Attempt is not allowed.',
+    blockedBy: [],
+    baseCommit: null,
+    baseFromAttemptId: null,
+  }
+  mission.derivedState = 'complete'
+  return attempt
+}
+
 function fakeClientContext(
   entries: Map<string, SlotEntry>,
   cleanups: Array<() => void>,
@@ -467,40 +489,44 @@ function snapshotFixture(): ForgeyardSnapshot {
       mission: {
         id: 'mission-1', title: 'Browser mission', objective: 'Prove the native browser-face round trip.',
         repository, baseRef: 'main', defaultPolicy: policy,
-        pipe: { nodes: [{ key: 'implement', task: 'Implement it.', verify: [requirement] }] },
+        pipe: { nodes: [{ key: 'implement', task: 'Implement it.', verify: [requirement], dependsOn: [] }] },
         pipeHash: 'd'.repeat(64), createdAt: 1,
       },
-      task: {
-        id: 'task-1', missionId: 'mission-1', sourceNodeKey: 'implement',
-        specification: { title: 'Browser mission', objective: 'Prove it.', instruction: 'Implement it.', verification: [requirement] },
-        dependencies: [], createdAt: 1,
-      },
-      attempts: [{
-        attempt: {
-          id: 'attempt-1', taskId: 'task-1', ordinal: 1,
-          executionSnapshot: {
-            version: 1, attemptId: 'attempt-1', ordinal: 1,
-            task: { title: 'Browser mission', objective: 'Prove it.', instruction: 'Implement it.', verification: [requirement] },
-            repository, baseCommit: 'a'.repeat(40), policy, verification: [requirement], createdAt: 1,
+      tasks: [{
+        task: {
+          id: 'task-1', missionId: 'mission-1', sourceNodeKey: 'implement',
+          specification: { title: 'Browser mission', objective: 'Prove it.', instruction: 'Implement it.', verification: [requirement] },
+          dependencies: [], createdAt: 1,
+        },
+        attempts: [{
+          attempt: {
+            id: 'attempt-1', taskId: 'task-1', ordinal: 1,
+            executionSnapshot: {
+              version: 1, attemptId: 'attempt-1', ordinal: 1,
+              task: { title: 'Browser mission', objective: 'Prove it.', instruction: 'Implement it.', verification: [requirement] },
+              repository, baseCommit: 'a'.repeat(40), policy, verification: [requirement], createdAt: 1,
+            },
+            executionSnapshotHash: 'e'.repeat(64), baseCommit: 'a'.repeat(40),
+            worktreePath: '/tmp/forgeyard-attempt-1', worktreeDevice: '1', worktreeInode: '4',
+            rawWorkspaceBaseline: null, rawWorkspaceBaselineHash: null,
+            retryOfAttemptId: null, successorAttemptId: null, dshSessionId: 'session-1', state: 'awaiting_decision',
+            startedAt: 1, endedAt: null, gitFingerprint: null, terminalReason: null, createdAt: 1, updatedAt: 1,
           },
-          executionSnapshotHash: 'e'.repeat(64), baseCommit: 'a'.repeat(40),
-          worktreePath: '/tmp/forgeyard-attempt-1', worktreeDevice: '1', worktreeInode: '4',
-          rawWorkspaceBaseline: null, rawWorkspaceBaselineHash: null,
-          retryOfAttemptId: null, successorAttemptId: null, dshSessionId: 'session-1', state: 'awaiting_decision',
-          startedAt: 1, endedAt: null, gitFingerprint: null, terminalReason: null, createdAt: 1, updatedAt: 1,
-        },
-        evidence: [], verifications: [], decisions: [],
-        review: {
-          reviewDigest: 'f'.repeat(64), liveGitFingerprint: 'unavailable', latestRunId: null,
-          requiredVerificationCount: 1, passingVerificationCount: 0, canApprove: false,
-          reviewedStateCurrent: false, approvalStale: true, reason: 'No trusted Evidence has been collected.',
-        },
-        promotions: [],
-        promotion: {
-          status: 'blocked', eligible: false, plannedRef: null, promotionId: null,
-          reason: 'Only an Attempt with a terminal APPROVE Decision can be promoted; this Attempt is awaiting_decision.',
-          reviewDigest: null, decisionId: null, outputRef: null, outputCommit: null, failureReason: null,
-        },
+          evidence: [], verifications: [], decisions: [],
+          review: {
+            reviewDigest: 'f'.repeat(64), liveGitFingerprint: 'unavailable', latestRunId: null,
+            requiredVerificationCount: 1, passingVerificationCount: 0, canApprove: false,
+            reviewedStateCurrent: false, approvalStale: true, reason: 'No trusted Evidence has been collected.',
+          },
+          promotions: [],
+          promotion: {
+            status: 'blocked', eligible: false, plannedRef: null, promotionId: null,
+            reason: 'Only an Attempt with a terminal APPROVE Decision can be promoted; this Attempt is awaiting_decision.',
+            reviewDigest: null, decisionId: null, outputRef: null, outputCommit: null, failureReason: null,
+          },
+        }],
+        readiness: { status: 'ready', startable: false, reason: 'The first Attempt already exists; use Retry for every successor.', blockedBy: [], baseCommit: null, baseFromAttemptId: null },
+        nodeState: 'awaiting_decision',
       }],
       derivedState: 'awaiting_decision',
     }],

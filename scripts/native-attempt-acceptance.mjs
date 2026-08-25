@@ -120,7 +120,7 @@ async function main() {
     step(`Mission + Task created; frozen model ${policy.provider}/${policy.model}, sandbox ${policy.sandboxMode}`)
 
     // Attempt 1 -> isolated worktree + native Session + queued model prompt.
-    const running = await remote('startAttempt', { taskId: mission.task.id })
+    const running = await remote('startAttempt', { taskId: mission.tasks[0].task.id })
     const attempt1 = running.attempt.id
     const worktree1 = running.attempt.worktreePath
     const session1 = running.attempt.dshSessionId
@@ -154,7 +154,7 @@ async function main() {
       throw new Error(`Retry did not create new isolated authority: ${JSON.stringify(retry.attempt)}`)
     }
     const afterRetry = await remote('snapshot', {})
-    const frozen1 = afterRetry.missions[0]?.attempts.find((item) => item.attempt.id === attempt1)
+    const frozen1 = afterRetry.missions[0]?.tasks[0]?.attempts.find((item) => item.attempt.id === attempt1)
     if (frozen1?.attempt.state !== 'retried' || frozen1.attempt.successorAttemptId !== attempt2
       || frozen1.decisions.map((decision) => decision.type).join(',') !== 'RETRY') {
       throw new Error(`Attempt 1 is not sealed with exactly one RETRY Decision: ${JSON.stringify(frozen1?.decisions)}`)
@@ -247,7 +247,7 @@ async function main() {
 
     // Attempt 1 must remain immutable after Attempt 2's terminal decision.
     const afterApprove = await remote('snapshot', {})
-    const stillFrozen1 = afterApprove.missions[0]?.attempts.find((item) => item.attempt.id === attempt1)
+    const stillFrozen1 = afterApprove.missions[0]?.tasks[0]?.attempts.find((item) => item.attempt.id === attempt1)
     if (stillFrozen1?.attempt.state !== 'retried'
       || JSON.stringify(stillFrozen1.evidence.map((item) => item.hash)) !== attempt1Evidence
       || stillFrozen1.decisions.map((decision) => decision.type).join(',') !== 'RETRY') {

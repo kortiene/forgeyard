@@ -6,8 +6,8 @@ import { ForgeyardDomainError, ForgeyardEngine } from '../../packages/forgeyard/
 import { TrustedEvidenceCollector } from '../../packages/forgeyard/src/host/evidence.ts'
 import type { PolicyOverrides, SessionGateway } from '../../packages/forgeyard/src/host/execution.ts'
 import { GitAuthority } from '../../packages/forgeyard/src/host/git.ts'
-import { hashRecord, sha256 } from '../../packages/forgeyard/src/host/hash.ts'
-import { ForgeyardStore } from '../../packages/forgeyard/src/host/store.ts'
+import { canonicalJson, hashRecord, sha256 } from '../../packages/forgeyard/src/host/hash.ts'
+import { assertAttemptRecordIntegrity, ForgeyardStore } from '../../packages/forgeyard/src/host/store.ts'
 import { makeCanonicalTempDir, run, seedRepository, testRuntime, type TestRuntime } from '../helpers/runtime.ts'
 
 const POLICY: ResolvedPolicySnapshot = {
@@ -133,11 +133,29 @@ describe('Milestone 1: one verified Attempt', () => {
 
   it('blocks a claimed success, binds approval to Evidence, and retries into a new Session and worktree', async () => {
     const mission = await engine.createMission(missionRequest())
-    expect(mission.task.sourceNodeKey).toBe('implement')
+    expect(mission.tasks).toHaveLength(1)
+    expect(mission.tasks[0]?.task.sourceNodeKey).toBe('implement')
+    expect(mission.tasks[0]?.attempts).toEqual([])
+    expect(mission.tasks[0]?.readiness).toEqual({
+      status: 'ready', startable: true, reason: null, blockedBy: [], baseCommit: null, baseFromAttemptId: null,
+    })
+    expect(mission.tasks[0]?.nodeState).toBe('ready')
+    expect(mission.derivedState).toBe('ready')
+    expect(mission.mission.pipe.nodes[0]?.dependsOn).toEqual([])
+    expect('task' in mission).toBe(false)
+    expect('attempts' in mission).toBe(false)
     expect(mission.mission.pipeHash).toMatch(/^[0-9a-f]{64}$/u)
 
-    const attempt1Running = await engine.startAttempt(mission.task.id)
+    const attempt1Running = await engine.startAttempt(mission.tasks[0].task.id)
     expect(attempt1Running.attempt.state).toBe('running')
+    const runningMission = await engine.missionView(mission.mission.id)
+    expect(runningMission.tasks[0]?.attempts.map(item => item.attempt.id)).toEqual([attempt1Running.attempt.id])
+    expect(runningMission.tasks[0]?.readiness).toMatchObject({
+      status: 'ready', startable: false, blockedBy: [],
+    })
+    expect(runningMission.tasks[0]?.readiness.reason).toMatch(/state running; a second initial Attempt is not allowed/u)
+    expect(runningMission.tasks[0]?.nodeState).toBe('running')
+    expect(runningMission.derivedState).toBe('running')
     expect(sessions.admissions[0]).toMatchObject({
       sessionId: attempt1Running.attempt.dshSessionId,
       cwd: attempt1Running.attempt.worktreePath,
@@ -208,6 +226,10 @@ describe('Milestone 1: one verified Attempt', () => {
       rationale: 'All frozen requirements passed against this exact review.',
     })
     expect(approved.attempt.state).toBe('approved')
+    const approvedMission = await engine.missionView(mission.mission.id)
+    expect(approvedMission.tasks[0]?.nodeState).toBe('approved')
+    expect(approvedMission.tasks[0]?.readiness.startable).toBe(false)
+    expect(approvedMission.derivedState).toBe('complete')
     expect(approved.decisions[0]?.reviewDigest).toBe(expectedDigest)
     expect(await engine.attemptView(attempt1Running.attempt.id)).toEqual(frozenAttempt1)
 
@@ -223,14 +245,244 @@ describe('Milestone 1: one verified Attempt', () => {
     store.close()
     store = new ForgeyardStore(databasePath)
     const afterRestart = await engineSnapshotWithStore(store, engine)
-    expect(afterRestart.missions[0]?.attempts.map(item => item.attempt.state)).toEqual(['retried', 'approved'])
-    expect(afterRestart.missions[0]?.attempts[0]).toEqual(frozenAttempt1)
+    expect(afterRestart.missions[0]?.tasks[0]?.attempts.map(item => item.attempt.state)).toEqual(['retried', 'approved'])
+    expect(afterRestart.missions[0]?.tasks[0]?.attempts[0]).toEqual(frozenAttempt1)
     await access(databasePath)
+  })
+
+  it('keeps the snapshot available when a Task records an unresolved dependency', async () => {
+    const healthy = await engine.createMission(missionRequest())
+    const pipe = {
+      nodes: [{
+        ...healthy.mission.pipe.nodes[0],
+        key: 'broken-follow-up',
+        dependsOn: ['missing-upstream'],
+      }],
+    }
+    const brokenMission = {
+      ...healthy.mission,
+      id: 'mission_broken_dependency_projection',
+      title: 'Broken dependency projection',
+      pipe,
+      pipeHash: hashRecord(pipe),
+      createdAt: healthy.mission.createdAt + 1,
+    }
+    const brokenTask = {
+      ...healthy.tasks[0].task,
+      id: 'task_broken_dependency_projection',
+      missionId: brokenMission.id,
+      sourceNodeKey: 'broken-follow-up',
+      dependencies: ['task_missing_from_mission'],
+      createdAt: brokenMission.createdAt,
+    }
+    store.insertMissionAndTask(brokenMission, brokenTask)
+
+    const snapshot = await engine.snapshot()
+    expect(snapshot.missions).toHaveLength(2)
+    expect(snapshot.missions.find(item => item.mission.id === healthy.mission.id)?.derivedState).toBe('ready')
+    const broken = snapshot.missions.find(item => item.mission.id === brokenMission.id)
+    expect(broken?.derivedState).toBe('blocked')
+    expect(broken?.tasks[0]?.readiness).toMatchObject({
+      status: 'blocked',
+      startable: false,
+      blockedBy: [],
+      baseCommit: null,
+      baseFromAttemptId: null,
+    })
+    expect(broken?.tasks[0]?.readiness.reason).toContain('task_missing_from_mission')
+    expect(broken?.tasks[0]?.readiness.reason).toContain('do not resolve within its Mission')
+  })
+
+  it('orders TaskNodeViews by the frozen Pipe rather than insertion time or Task ID', async () => {
+    const seed = await engine.createMission(missionRequest())
+    const requirement = seed.mission.pipe.nodes[0]?.verify ?? []
+    const pipe = {
+      nodes: [
+        { key: 'A', task: 'Implement A.', verify: requirement, dependsOn: [] },
+        { key: 'B', task: 'Implement B.', verify: requirement, dependsOn: [] },
+      ],
+    }
+    const orderedMission = {
+      ...seed.mission,
+      id: 'mission_pipe_order_projection',
+      title: 'Pipe ordering projection',
+      pipe,
+      pipeHash: hashRecord(pipe),
+      createdAt: seed.mission.createdAt + 10,
+    }
+    // Deliberately insert B first and give it the earlier timestamp. A storage
+    // query ordered by created_at/id returns B,A; the public view must return A,B.
+    const taskB = {
+      ...seed.tasks[0].task,
+      id: 'task_pipe_order_b',
+      missionId: orderedMission.id,
+      sourceNodeKey: 'B',
+      specification: { ...seed.tasks[0].task.specification, title: 'B', instruction: 'Implement B.' },
+      createdAt: orderedMission.createdAt,
+    }
+    store.insertMissionAndTask(orderedMission, taskB)
+    const taskA = {
+      ...seed.tasks[0].task,
+      id: 'task_pipe_order_a',
+      missionId: orderedMission.id,
+      sourceNodeKey: 'A',
+      specification: { ...seed.tasks[0].task.specification, title: 'A', instruction: 'Implement A.' },
+      createdAt: orderedMission.createdAt + 1,
+    }
+    store.database.prepare(`INSERT INTO tasks
+      (id,mission_id,source_node_key,specification_json,dependencies_json,created_at)
+      VALUES (?,?,?,?,?,?)`).run(
+      taskA.id, taskA.missionId, taskA.sourceNodeKey,
+      JSON.stringify(taskA.specification), JSON.stringify(taskA.dependencies), taskA.createdAt,
+    )
+
+    expect(store.tasksForMission(orderedMission.id).map(task => task.sourceNodeKey)).toEqual(['B', 'A'])
+    const view = await engine.missionView(orderedMission.id)
+    expect(view.tasks.map(node => node.task.sourceNodeKey)).toEqual(['A', 'B'])
+    expect(view.tasks.map(node => node.nodeState)).toEqual(['ready', 'ready'])
+    expect(view.derivedState).toBe('ready')
+  })
+
+  it('refuses to admit a dependency-bearing node on both the initial and the retry path', async () => {
+    // A dependency-bearing node must never execute until dependency admission and
+    // base propagation exist. The public path already refuses the initial Attempt;
+    // this also pins the Retry path, which resolves the Mission base ref and would
+    // otherwise let a seeded or persisted retryable Attempt produce a successor on
+    // the wrong base. createMission only mints dependency-free single-node Pipes
+    // today, so the two-node Mission and its retryable Attempt are seeded directly.
+    const seed = await engine.createMission(missionRequest())
+    const requirement = seed.tasks[0].task.specification.verification
+    const now = Date.now()
+    const pipe = {
+      nodes: [
+        { key: 'A', task: 'Implement A.', verify: requirement, dependsOn: [] },
+        { key: 'B', task: 'Implement B on A.', verify: requirement, dependsOn: ['A'] },
+      ],
+    }
+    const mission = {
+      ...seed.mission,
+      id: 'mission_dependency_admission_guard',
+      title: 'Dependency admission guard',
+      pipe,
+      pipeHash: hashRecord(pipe),
+      createdAt: now,
+    }
+    const taskA = {
+      ...seed.tasks[0].task,
+      id: 'task_dependency_guard_a',
+      missionId: mission.id,
+      sourceNodeKey: 'A',
+      specification: { ...seed.tasks[0].task.specification, title: 'A', instruction: 'Implement A.' },
+      dependencies: [],
+      createdAt: now,
+    }
+    const taskB = {
+      ...seed.tasks[0].task,
+      id: 'task_dependency_guard_b',
+      missionId: mission.id,
+      sourceNodeKey: 'B',
+      specification: { ...seed.tasks[0].task.specification, title: 'B', instruction: 'Implement B on A.' },
+      dependencies: [taskA.id],
+      createdAt: now + 1,
+    }
+    store.insertMissionAndTask(mission, taskA)
+    store.database.prepare(`INSERT INTO tasks
+      (id,mission_id,source_node_key,specification_json,dependencies_json,created_at)
+      VALUES (?,?,?,?,?,?)`).run(
+      taskB.id, taskB.missionId, taskB.sourceNodeKey,
+      JSON.stringify(taskB.specification), JSON.stringify(taskB.dependencies), taskB.createdAt,
+    )
+
+    // Initial path: the public entry point refuses a dependency-bearing node.
+    await expect(engine.startAttempt(taskB.id)).rejects.toMatchObject<Partial<ForgeyardDomainError>>({ code: 'INVALID_STATE' })
+    await expect(engine.startAttempt(taskB.id)).rejects.toThrow(/dependency admission and base propagation/u)
+
+    // Seed a structurally valid retryable Attempt on the dependency-bearing
+    // node. The insert-phase guard only admits a 'preparing' row; bind the same
+    // durable worktree identity/raw-baseline authority a real Attempt carries,
+    // then walk the store's own transitions to 'awaiting_decision'.
+    const snapshot: ExecutionSnapshot = {
+      version: 1,
+      attemptId: 'attempt_dependency_guard_b1',
+      ordinal: 1,
+      task: structuredClone(taskB.specification),
+      repository: structuredClone(seed.mission.repository),
+      baseCommit: seed.mission.repository.checkoutHead,
+      policy: structuredClone(POLICY),
+      verification: structuredClone(taskB.specification.verification),
+      createdAt: now,
+    }
+    store.createAttempt({
+      id: snapshot.attemptId,
+      taskId: taskB.id,
+      ordinal: 1,
+      executionSnapshot: snapshot,
+      executionSnapshotHash: hashRecord(snapshot),
+      baseCommit: snapshot.baseCommit,
+      worktreePath: join(root, 'worktrees', 'seeded-dependency-b1'),
+      worktreeDevice: null,
+      worktreeInode: null,
+      rawWorkspaceBaseline: null,
+      rawWorkspaceBaselineHash: null,
+      retryOfAttemptId: null,
+      successorAttemptId: null,
+      dshSessionId: 'session-seeded-dependency-b1',
+      state: 'preparing',
+      startedAt: null,
+      endedAt: null,
+      gitFingerprint: null,
+      terminalReason: null,
+      createdAt: now,
+      updatedAt: now,
+    })
+    const baselineCanonical = canonicalJson({ entries: [], rootPath: '.', version: 1 })
+    const baseline = {
+      version: 1 as const,
+      rootPath: '.' as const,
+      entries: [],
+      canonical: baselineCanonical,
+      hash: sha256(baselineCanonical),
+    }
+    store.bindWorktreeIdentity(snapshot.attemptId, '1', '1', baseline, baseline.hash)
+    for (const next of ['worktree_ready', 'session_bound', 'running', 'verifying', 'awaiting_decision'] as const) {
+      store.transition(snapshot.attemptId, next)
+    }
+    const predecessor = store.attempt(snapshot.attemptId)
+    expect(predecessor).toMatchObject({
+      state: 'awaiting_decision',
+      successorAttemptId: null,
+      worktreeDevice: '1',
+      worktreeInode: '1',
+      rawWorkspaceBaselineHash: baseline.hash,
+    })
+    expect(predecessor).toBeDefined()
+    expect(() => assertAttemptRecordIntegrity(predecessor!)).not.toThrow()
+
+    // Retry path: the same guard must fire before any base is resolved, so the
+    // successor is never created on the Mission base ref.
+    await expect(engine.retry({
+      attemptId: snapshot.attemptId,
+      actor: 'operator',
+      rationale: 'A dependency-bearing node must not be retried onto the Mission base ref.',
+    })).rejects.toMatchObject<Partial<ForgeyardDomainError>>({ code: 'INVALID_STATE' })
+    await expect(engine.retry({
+      attemptId: snapshot.attemptId,
+      actor: 'operator',
+      rationale: 'A dependency-bearing node must not be retried onto the Mission base ref.',
+    })).rejects.toThrow(/dependency admission and base propagation/u)
+
+    // The refused retry is side-effect free: the predecessor is byte-for-byte
+    // unchanged, no RETRY Decision or successor exists, no Session was admitted,
+    // and the Task still owns exactly its one seeded Attempt.
+    expect(store.attempt(snapshot.attemptId)).toEqual(predecessor)
+    expect(store.decisions(snapshot.attemptId)).toEqual([])
+    expect(store.attemptsForTask(taskB.id).map(item => item.id)).toEqual([snapshot.attemptId])
+    expect(sessions.admissions).toEqual([])
   })
 
   it('persists only the v1 authority tables, enforces append-only records, and fails recovery closed', async () => {
     const mission = await engine.createMission(missionRequest())
-    const running = await engine.startAttempt(mission.task.id)
+    const running = await engine.startAttempt(mission.tasks[0].task.id)
     expect(running.attempt.state).toBe('running')
 
     const tables = (store.database.prepare(
@@ -249,7 +501,7 @@ describe('Milestone 1: one verified Attempt', () => {
     expect(recovered.recoverAfterRestart()).toBe(1)
     expect(store.attempt(running.attempt.id)?.state).toBe('needs_review')
     expect(sessions.admissions).toHaveLength(1)
-    expect(store.attemptsForTask(mission.task.id)).toHaveLength(1)
+    expect(store.attemptsForTask(mission.tasks[0].task.id)).toHaveLength(1)
 
     await recovered.verifyAttempt(running.attempt.id)
     const evidence = store.evidence(running.attempt.id)
@@ -276,7 +528,7 @@ describe('Milestone 1: one verified Attempt', () => {
 
   it('uses the DSH maintenance phase as a mutation fence and stales a digest when queued work resumes', async () => {
     const mission = await engine.createMission(missionRequest())
-    const running = await engine.startAttempt(mission.task.id)
+    const running = await engine.startAttempt(mission.tasks[0].task.id)
     await writeFile(join(running.attempt.worktreePath, 'result.txt'), 'fixed\n')
 
     const verified = await engine.verifyAttempt(running.attempt.id)
@@ -303,7 +555,7 @@ describe('Milestone 1: one verified Attempt', () => {
 
   it('selects the latest append-ordered verification run without rewriting prior Evidence', async () => {
     const mission = await engine.createMission(missionRequest())
-    const running = await engine.startAttempt(mission.task.id)
+    const running = await engine.startAttempt(mission.tasks[0].task.id)
     const failed = await engine.verifyAttempt(running.attempt.id)
     const failedRun = failed.review.latestRunId
     expect(failed.verifications.at(-1)?.status).toBe('FAIL')
@@ -324,18 +576,18 @@ describe('Milestone 1: one verified Attempt', () => {
 
   it('admits the initial Attempt exactly once and requires Retry for every successor', async () => {
     const mission = await engine.createMission(missionRequest())
-    const first = await engine.startAttempt(mission.task.id)
+    const first = await engine.startAttempt(mission.tasks[0].task.id)
 
-    await expect(engine.startAttempt(mission.task.id)).rejects.toMatchObject<Partial<ForgeyardDomainError>>({
+    await expect(engine.startAttempt(mission.tasks[0].task.id)).rejects.toMatchObject<Partial<ForgeyardDomainError>>({
       code: 'INVALID_STATE',
     })
-    expect(store.attemptsForTask(mission.task.id).map(item => item.id)).toEqual([first.attempt.id])
+    expect(store.attemptsForTask(mission.tasks[0].task.id).map(item => item.id)).toEqual([first.attempt.id])
     expect(sessions.admissions).toHaveLength(1)
   })
 
   it('leaves the predecessor untouched when Retry preflight cannot prove a clean base', async () => {
     const mission = await engine.createMission(missionRequest())
-    const first = await engine.startAttempt(mission.task.id)
+    const first = await engine.startAttempt(mission.tasks[0].task.id)
     await engine.verifyAttempt(first.attempt.id)
     const predecessor = store.attempt(first.attempt.id)
 
@@ -348,12 +600,12 @@ describe('Milestone 1: one verified Attempt', () => {
 
     expect(store.attempt(first.attempt.id)).toEqual(predecessor)
     expect(store.decisions(first.attempt.id)).toEqual([])
-    expect(store.attemptsForTask(mission.task.id)).toHaveLength(1)
+    expect(store.attemptsForTask(mission.tasks[0].task.id)).toHaveLength(1)
   })
 
   it('fails approval closed when an extra append-only record contaminates the latest Evidence set', async () => {
     const mission = await engine.createMission(missionRequest())
-    const running = await engine.startAttempt(mission.task.id)
+    const running = await engine.startAttempt(mission.tasks[0].task.id)
     await writeFile(join(running.attempt.worktreePath, 'result.txt'), 'fixed\n')
     const verified = await engine.verifyAttempt(running.attempt.id)
     expect(verified.review.canApprove).toBe(true)
@@ -397,7 +649,7 @@ describe('Milestone 1: one verified Attempt', () => {
     await run(runtime.runner, repositoryPath, ['git', 'commit', '-m', 'write verifier cache'])
 
     const mission = await engine.createMission(missionRequest())
-    const running = await engine.startAttempt(mission.task.id)
+    const running = await engine.startAttempt(mission.tasks[0].task.id)
     await writeFile(join(running.attempt.worktreePath, 'result.txt'), 'fixed\n')
     const verified = await engine.verifyAttempt(running.attempt.id)
 
@@ -413,7 +665,7 @@ describe('Milestone 1: one verified Attempt', () => {
     await run(runtime.runner, repositoryPath, ['git', 'add', '--', 'verify.mjs'])
     await run(runtime.runner, repositoryPath, ['git', 'commit', '-m', 'large verifier output'])
     const mission = await engine.createMission(missionRequest())
-    const running = await engine.startAttempt(mission.task.id)
+    const running = await engine.startAttempt(mission.tasks[0].task.id)
     const verified = await engine.verifyAttempt(running.attempt.id)
 
     expect(verified.verifications[0]?.status).toBe('INCOMPLETE')
@@ -429,7 +681,7 @@ describe('Milestone 1: one verified Attempt', () => {
 
   it('marks review stale when the original base checkout changes after Evidence', async () => {
     const mission = await engine.createMission(missionRequest())
-    const running = await engine.startAttempt(mission.task.id)
+    const running = await engine.startAttempt(mission.tasks[0].task.id)
     await writeFile(join(running.attempt.worktreePath, 'result.txt'), 'fixed\n')
     const verified = await engine.verifyAttempt(running.attempt.id)
     expect(verified.review.canApprove).toBe(true)
@@ -450,8 +702,8 @@ describe('Milestone 1: one verified Attempt', () => {
   it('validates Decisions before fencing and can cancel a pre-Session stranded Attempt', async () => {
     const mission = await engine.createMission(missionRequest())
     sessions.failNextAdmission = true
-    await expect(engine.startAttempt(mission.task.id)).rejects.toMatchObject<Partial<ForgeyardDomainError>>({ code: 'DSH_ERROR' })
-    const stranded = store.attemptsForTask(mission.task.id)[0]
+    await expect(engine.startAttempt(mission.tasks[0].task.id)).rejects.toMatchObject<Partial<ForgeyardDomainError>>({ code: 'DSH_ERROR' })
+    const stranded = store.attemptsForTask(mission.tasks[0].task.id)[0]
     if (stranded === undefined) throw new Error('stranded Attempt was not retained')
     expect(stranded.state).toBe('needs_review')
     expect(sessions.admissions).toHaveLength(0)
@@ -479,7 +731,7 @@ describe('Milestone 1: one verified Attempt', () => {
 
   it('keeps latest-run selection and the review digest stable across VACUUM', async () => {
     const mission = await engine.createMission(missionRequest())
-    const running = await engine.startAttempt(mission.task.id)
+    const running = await engine.startAttempt(mission.tasks[0].task.id)
     await writeFile(join(running.attempt.worktreePath, 'result.txt'), 'fixed\n')
     const verified = await engine.verifyAttempt(running.attempt.id)
     const before = verified.review

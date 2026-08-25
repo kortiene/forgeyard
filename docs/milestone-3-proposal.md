@@ -21,8 +21,8 @@ Decision → Promotion`. What they did **not** prove is that Forgeyard is a
 *workspace* rather than a single-attempt review tool.
 
 The honest gap: `PipeSnapshot` exists but `createMission` hard-codes one
-`implement` node (`engine.ts:298`) and materializes exactly one Task with
-`dependencies: []` (`engine.ts:316`). Nothing reads `dependencies` — a grep
+`implement` node in `ForgeyardEngine.createMission` and materializes exactly
+one Task with `dependencies: []`. Nothing reads `dependencies` — a grep
 across `src/host` finds only the write path in `store.ts` and the schema in
 `migrations.ts`. There is no readiness calculation, no scheduling, and no output
 propagation. `MissionCreateRequest` exposes a single `verificationCommand` even
@@ -46,7 +46,7 @@ explicit Decision. In the Milestone 3 fixture, Task A is upstream (must promote)
 and Task B is terminal (need not).
 
 **Consequence for acceptance, which revision 1 got wrong:** `outputCommit`
-exists *only* on a `PromotionRecord` (`types.ts:362`). If B is not promoted, B
+exists *only* on `PromotionRecord.outputCommit`. If B is not promoted, B
 has no `outputCommit` and no Promotion record, so no acceptance criterion may
 refer to either for B. Criteria 6 and 8 are corrected accordingly.
 
@@ -54,7 +54,7 @@ refer to either for B. Criteria 6 and 8 are corrected accordingly.
 
 This rule governs what Forgeyard **requires**, not what it permits. Promotion is
 already *possible* for every approved Attempt: `promotionEligibility`
-(`engine.ts:1129-1242`) is purely per-Attempt — it reads that Attempt's
+(`ForgeyardEngine.promotionEligibility`) is purely per-Attempt — it reads that Attempt's
 promotions, its `APPROVE` Decision, and the live review digest, and has **no**
 notion of a graph. The profile smoke already promotes a single-node (therefore
 terminal) Mission end to end. An operator may promote a terminal node whenever
@@ -78,7 +78,7 @@ reasons:
 
 Deferring promotion is not free, and this is the strongest argument against the
 rule. Eligibility fails when
-`review.reviewDigest !== decision.reviewDigest` (`engine.ts:1238`), so an
+`review.reviewDigest !== decision.reviewDigest` inside `promotionEligibility`, so an
 approved terminal node whose worktree later drifts becomes **permanently
 unpromotable** — "approve now, promote later" is not a safe assumption. Combined
 with rejection finality (Q3), a deliverable can be quietly lost.
@@ -99,7 +99,7 @@ is the Attempt's frozen base. Milestone 3 must **not** invent a second output
 concept: Task B's base is literally `promotions.output_commit`.
 
 But a stored `status = 'promoted'` is **not self-certifying**. The engine already
-says so in `promotionEligibility` (`engine.ts:1162-1215`): the row and the ref
+says so in `ForgeyardEngine.promotionEligibility`: the row and the ref
 are two independent facts, and anyone with repository write access can delete,
 move, or symref a `refs/forgeyard/` name outside Forgeyard. That path
 re-canonicalizes the repository, asserts the recorded repository snapshot,
@@ -133,9 +133,9 @@ Revision 1 said "the operator retries upstream". **That is impossible under the
 current authority model**, which I verified:
 
 - `RETRYABLE_STATES` is `{awaiting_decision, interrupted, needs_review}`
-  (`engine.ts:164`) — `rejected` is excluded.
+  in `RETRYABLE_STATES` — `rejected` is excluded.
 - `attempts_retry_insert_guard` (migration 002) enforces the same set in SQL.
-- `startAttempt` refuses when any Attempt exists (`engine.ts:326`), and
+- `ForgeyardEngine.startAttempt` refuses when any Attempt exists, and
   `UNIQUE(task_id, ordinal)` plus `attempts_initial_insert_guard` permit exactly
   one initial Attempt per Task, ever.
 
@@ -180,7 +180,7 @@ practice, (a) becomes a justified follow-up with its own acceptance.
 
 `tasks` already has `source_node_key` and `dependencies_json`
 (`001_initial.sql:19-26`), already parsed into `TaskRecord.dependencies`
-(`store.ts:71`). `AttemptRecord.baseCommit` is already an arbitrary commit OID,
+by the store's Task row parser. `AttemptRecord.baseCommit` is already an arbitrary commit OID,
 and `GitAuthority.createWorktree(repository, baseCommit, attemptId)`
 (`git.ts:641`) already accepts any commit — so freezing B's base to A's promoted
 commit changes only which OID `planAttempt` resolves. **No Git-authority change,
@@ -188,7 +188,7 @@ no SQL migration.**
 
 However, revision 1 missed that the frozen Pipe cannot express the edge.
 `PipeSnapshot` is `{ nodes }` and `PipeNodeSnapshot` is `{ key, task, verify }`
-(`types.ts:67-75`) — nothing distinguishes A→B from B→A or two independent
+in the public types — nothing distinguishes A→B from B→A or two independent
 nodes. Deriving `B.dependencies` from array order would be an undocumented
 convention inside a hashed, immutable snapshot.
 
@@ -204,10 +204,10 @@ exactly the single-node truth today.
 the **public Typert Remote surface must change**, and that is the largest single
 piece of Milestone 3. Recorded in issue #5 and decided there.
 
-`MissionView` carries a **singular** Task (`types.ts:440-445`), and
-`missionViewUnqueued` (`engine.ts:1269-1277`) reads exactly one through
-`store.taskForMission` — literally `ORDER BY created_at,id LIMIT 1`
-(`store.ts:384`) — then throws `'Mission has no materialized Task'` otherwise,
+The pre-reshape `MissionView` carries a **singular** Task, and
+`missionViewUnqueued` reads exactly one through `store.taskForMission` —
+literally `ORDER BY created_at,id LIMIT 1` — then throws
+`'Mission has no materialized Task'` otherwise,
 flattening `attempts` to that one Task. A two-node Mission cannot be represented
 in that shape.
 
@@ -215,11 +215,12 @@ in that shape.
 `forgeyard` is unpublished (`npm view forgeyard` → 404), single-machine and
 single-user, so no external caller needs protecting. An alias would also be
 *actively wrong*: on a Pipe, `mission.task` would silently mean "whichever node
-sorts first", and `components.tsx:363` calls `startAttempt(mission.task.id)` —
-an arbitrary node, started under a compatibility label.
+sorts first", and the pre-reshape `MissionDetail` calls
+`startAttempt(mission.task.id)` — an arbitrary node, started under a
+compatibility label.
 
 **Decision: `derivedState` becomes per-node state plus a Mission-level rollup.**
-It is currently `attempts.at(-1)?.attempt.state ?? 'ready'` (`engine.ts:1276`),
+The pre-reshape expression is `attempts.at(-1)?.attempt.state ?? 'ready'`,
 which collapses every Attempt in the Mission to the last one and is equally
 single-Task-shaped. Shipping a plural `tasks` beside it would merely relocate
 the lie. Each node reports its own Attempt state and readiness; the Mission
@@ -239,11 +240,11 @@ reports an honest summary derived from **all** nodes. Criterion 7 needs both.
 Naming `TaskNodeView` without defining it would leave several incompatible
 Typert designs all satisfying this prose. It is specified here, following the
 existing `PromotionEligibility` precedent of a status union beside a nullable
-human-readable `reason` (`types.ts:382-407`):
+human-readable `reason` in `PromotionEligibility`:
 
 ```ts
 export type TaskReadinessStatus =
-  /** Every declared dependency is satisfied; an Attempt may be started. */
+  /** Every declared dependency is satisfied. Admission is reported separately by `startable`. */
   | 'ready'
   /** At least one dependency is unsatisfied, unsettled, or diverged. */
   | 'blocked'
@@ -255,7 +256,7 @@ export type TaskReadinessStatus =
 
 export interface TaskReadiness {
   status: TaskReadinessStatus
-  /** True only for `ready`; `startAttempt` must refuse otherwise. */
+  /** True exactly when dependencies are ready and this Task has no initial Attempt yet. */
   startable: boolean
   /** Operator-facing explanation. Always set for `blocked` and `dead`. */
   reason: string | null
@@ -277,11 +278,12 @@ export interface TaskNodeView {
   attempts: AttemptView[]
   readiness: TaskReadiness
   /** This node's own state: the latest Attempt state, or 'ready' when none. */
-  nodeState: string
+  nodeState: AttemptState | 'ready'
 }
 
 export interface MissionView {
   mission: MissionRecord
+  /** Exactly one view per materialized node, in frozen PipeSnapshot.nodes order. */
   tasks: TaskNodeView[]          // replaces `task: TaskRecord`
   derivedState: MissionRollupState
 }
@@ -300,19 +302,21 @@ Attempt — so the rollup needs declared values and a **total, ordered** rule.
 
 | # | Condition over all nodes | Rollup |
 | --- | --- | --- |
-| 1 | any node has a `running`/`verifying`/`preparing` Attempt | `running` |
+| 1 | any node has a `preparing`/`worktree_ready`/`session_bound`/`running`/`verifying` Attempt | `running` |
 | 2 | any node awaits a Decision (`awaiting_decision`) | `awaiting_decision` |
 | 3 | any node is `needs_review` or `interrupted` | `needs_review` |
 | 4 | any node readiness is `dead` | `dead` |
 | 5 | any node has a `rejected` or `cancelled` terminal Attempt | `stopped` |
 | 6 | every node is `approved` (and every upstream node promoted) | `complete` |
-| 7 | any node readiness is `ready` | `ready` |
+| 7 | any node has `readiness.startable === true` | `ready` |
 | 8 | otherwise | `blocked` |
 
 Attention-demanding states outrank quiescent ones, so a Mission never renders
 `complete` or `ready` while any node needs an operator. For today's single-node
-Missions this reduces to exactly the current `attempts.at(-1)` behavior, which
-is what the reshape commit must prove.
+Missions this preserves the operational progression while intentionally
+normalizing terminal labels (for example `approved` → `complete` and
+`rejected`/`cancelled` → `stopped`). The reshape commit must prove that
+Attempt admission and history are otherwise unchanged.
 
 Because `smoke:profile` runs inside `pnpm check`, this is a **required-CI-visible**
 change: the safety gate goes red until every consumer moves in the same commit.
@@ -372,10 +376,10 @@ five were correct. Recorded because they materially changed the design:
 
 | Finding | Verified against | Correction |
 | --- | --- | --- |
-| Readiness must re-validate the promotion ref | `engine.ts:1162-1215` | Readiness reuses the `promotionEligibility` invariants; `diverged` blocks B (Q2, criterion 4) |
-| Rejected upstream has **no** retry path | `engine.ts:164,326`, migration 002 | New terminal `dead` state; remedy is a new Mission, not a retry (Q3, criterion 9) |
-| Terminal-node rule contradicted criteria 6/8 | `types.ts:362` | B has no `outputCommit`/Promotion; chain asserted via B's worktree (criteria 6, 8) |
-| `PipeSnapshot` cannot express an edge | `types.ts:67-75` | Add `dependsOn: string[]`; JSON-only, no SQL migration (Q5) |
+| Readiness must re-validate the promotion ref | `ForgeyardEngine.promotionEligibility` | Readiness reuses the `promotionEligibility` invariants; `diverged` blocks B (Q2, criterion 4) |
+| Rejected upstream has **no** retry path | `RETRYABLE_STATES`, `startAttempt`, migration 002 | New terminal `dead` state; remedy is a new Mission, not a retry (Q3, criterion 9) |
+| Terminal-node rule contradicted criteria 6/8 | `PromotionRecord.outputCommit` | B has no `outputCommit`/Promotion; chain asserted via B's worktree (criteria 6, 8) |
+| `PipeSnapshot` cannot express an edge | public `PipeSnapshot` types | Add `dependsOn: string[]`; JSON-only, no SQL migration (Q5) |
 | Non-remediation was unenforceable as stated | Host reviews B only vs. its frozen base | Downgraded to an explicit convention, with the enforcement option named (Q4) |
 
 ## Explicitly out of scope

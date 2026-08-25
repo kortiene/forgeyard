@@ -159,7 +159,7 @@ export class ForgeyardCockpitController {
 
   async startAttempt(taskId: TaskId): Promise<void> {
     await this.mutate('Starting attempt', () => this.api.startAttempt(taskId), (attempt, data) => {
-      const mission = data.missions.find(candidate => candidate.task.id === attempt.attempt.taskId)
+      const mission = data.missions.find(candidate => candidate.tasks.some(node => node.task.id === attempt.attempt.taskId))
       if (mission === undefined) return { name: 'missions' }
       return {
         name: 'attempt',
@@ -378,8 +378,10 @@ export class ForgeyardCockpitController {
 
   private findAttempt(attemptId: AttemptId): { mission: MissionView; attempt: AttemptView } | undefined {
     for (const mission of this.current.data?.missions ?? []) {
-      const attempt = mission.attempts.find(candidate => candidate.attempt.id === attemptId)
-      if (attempt !== undefined) return { mission, attempt }
+      for (const node of mission.tasks) {
+        const attempt = node.attempts.find(candidate => candidate.attempt.id === attemptId)
+        if (attempt !== undefined) return { mission, attempt }
+      }
     }
     return undefined
   }
@@ -395,10 +397,22 @@ export class ForgeyardCockpitController {
   }
 }
 
+/**
+ * Every Attempt of a Mission, flattened across its Pipe nodes in node order.
+ *
+ * A Mission no longer carries a flat Attempt list: history belongs to a node,
+ * because a flattened list cannot say which node an Attempt came from. Callers
+ * that genuinely need the whole Mission (session indexing, view resolution)
+ * flatten explicitly here.
+ */
+export function missionAttempts(mission: MissionView): AttemptView[] {
+  return mission.tasks.flatMap(node => node.attempts)
+}
+
 function sessionAttemptIndex(data: ForgeyardSnapshot): Readonly<Record<string, AttemptId | null>> {
   const index: Record<string, AttemptId | null> = {}
   for (const mission of data.missions) {
-    for (const attempt of mission.attempts) {
+    for (const attempt of missionAttempts(mission)) {
       const sessionId = attempt.attempt.dshSessionId
       if (sessionId === '') continue
       const existing = index[sessionId]
@@ -415,14 +429,14 @@ function normalizeView(view: CockpitView, data: ForgeyardSnapshot): CockpitView 
   const mission = data.missions.find(candidate => candidate.mission.id === view.missionId)
   if (mission === undefined) return { name: 'missions' }
   if (view.name === 'mission') return view
-  return mission.attempts.some(candidate => candidate.attempt.id === view.attemptId)
+  return missionAttempts(mission).some(candidate => candidate.attempt.id === view.attemptId)
     ? view
     : { name: 'mission', missionId: view.missionId }
 }
 
 function viewForAttempt(data: ForgeyardSnapshot, attemptId: AttemptId): CockpitView {
   for (const mission of data.missions) {
-    if (mission.attempts.some(candidate => candidate.attempt.id === attemptId)) {
+    if (missionAttempts(mission).some(candidate => candidate.attempt.id === attemptId)) {
       return { name: 'attempt', missionId: mission.mission.id, attemptId }
     }
   }
