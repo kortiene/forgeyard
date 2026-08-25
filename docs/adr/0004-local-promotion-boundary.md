@@ -239,6 +239,26 @@ queue across that would leave every Remote request — including the Cockpit's
 first snapshot — waiting behind it, so a Host recovering quietly would look like
 a Host that is down.
 
+An absent ref and a broken one are also different facts. `rev-parse --verify
+--quiet` exits identically for both — status 1, nothing on stdout — and only a
+stderr warning separates a ref file holding a malformed object name from a name
+nobody has used. Reading the second as the first would settle a Promotion as "no
+durable output exists" and send every retry into a collision with the ref that is
+still sitting there, so the namespace being occupied is treated as the
+disagreement it is.
+
+Validation follows the promotion's parent edge, not just its tree. The commit
+names a frozen base parent, and a walk that stops at the commit reported a
+pruned base as a durable output while `git show` on it could not parse. Exactly
+two generations are walked: the promotion and its parent, which is the edge the
+record claims and not the repository's whole history.
+
+Promotion text is rejected unless SQLite can store it unchanged. An unpaired
+UTF-16 surrogate is written as U+FFFD, so text hashed before that write can never
+match the text read back: the Promotion would create its durable ref and then
+fail its own integrity check forever, reporting invalid authority over a real
+output. Refusing the input is the last point at which that is recoverable.
+
 The promotion commit pins `i18n.commitEncoding=UTF-8` alongside disabling
 signing. A repository-local encoding adds an `encoding` header and changes the
 object name for the same tree, parent, message, identity, and date; ambient

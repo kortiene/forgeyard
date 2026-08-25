@@ -110,6 +110,9 @@ Git itself refuses).
 | a retained `failed` Promotion no longer verifies | promotion is blocked: every retained record is audit authority, not just the active one |
 | background reconciliation meets a stalled repository | the Cockpit keeps serving; only settlements take the engine queue |
 | the repository sets `i18n.commitEncoding` | ignored — the promotion commit pins UTF-8, so a retry still computes the same commit |
+| the promotion ref file holds a malformed object name | reported as occupied, not absent; the Attempt is not told it may promote again into a ref that is still there |
+| the promoted commit's frozen base parent is pruned | reported as `diverged`: validation follows the parent edge the record claims, not only the promoted tree |
+| `actor` or `rationale` contains an unpaired UTF-16 surrogate | refused as `INVALID_REQUEST` before anything durable exists, because SQLite would store it as U+FFFD and the record could never verify again |
 | an expired Promotion's name is occupied by a symbolic ref | settled `failed` and the Attempt released, rather than repeating the pass forever; the symref is left exactly as found |
 | the repository is replaced between planning and the ref write | the write is refused; reporting the mismatch afterwards could not have undone it |
 | this Host stalls past its own lease before writing the ref | the write is refused, no durable output exists, and the Attempt may be promoted again |

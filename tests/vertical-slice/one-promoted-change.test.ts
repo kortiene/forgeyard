@@ -1,5 +1,5 @@
 import { chmod, cp, mkdir, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
   AttemptRecord,
@@ -1170,6 +1170,72 @@ describe('Milestone 2: one promoted change', () => {
 
     release()
     await pass
+  })
+
+  it('never reports a broken promotion ref as an absent one', async () => {
+    const approved = await approvedAttempt()
+    const decision = approved.decisions[0] as DecisionRecord
+    const record = await pendingPromotion(approved.attempt, decision, approved.attempt.baseCommit)
+
+    // A ref file holding a malformed object name. `rev-parse --verify --quiet`
+    // exits 1 with empty stdout exactly as it does for a ref that is not there,
+    // and only warns on stderr — but the namespace is still occupied.
+    const refPath = join(repositoryPath, '.git', record.outputRef)
+    await mkdir(dirname(refPath), { recursive: true })
+    await writeFile(refPath, 'not-an-object-name\n')
+
+    await expect(engine.git.readPromotionRef(repositoryPath, record.outputRef))
+      .rejects.toThrow(/exists but Git cannot read it/u)
+
+    // Settling "no durable output exists, so the Attempt may be promoted again"
+    // would send every retry into a collision with the ref sitting right there.
+    expect(await engine.reconcilePromotions()).toBe(1)
+    const settled = store.promotion(record.id) as PromotionRecord
+    expect(settled.status).toBe('failed')
+    expect(settled.failureReason).toMatch(/No usable Forgeyard-owned output exists/u)
+    expect(settled.failureReason).not.toMatch(/No durable output exists/u)
+  })
+
+  it('refuses a promoted commit whose frozen base parent was pruned', async () => {
+    const approved = await approvedAttempt()
+    const promoted = await promote(approved)
+    const record = promoted.promotions[0] as PromotionRecord
+
+    // The promotion commit, its tree, and its blobs all survive; the base commit
+    // it names as parent does not. `git show` on the promotion cannot parse it.
+    const base = approved.attempt.baseCommit
+    await rm(join(repositoryPath, '.git', 'objects', base.slice(0, 2), base.slice(2)), { force: true })
+    expect((await run(runtime.runner, repositoryPath, ['git', 'show', record.outputCommit], true)).exitCode)
+      .not.toBe(0)
+
+    await expect(engine.git.readPromotionRef(repositoryPath, record.outputRef))
+      .rejects.toThrow(/not all readable in this repository/u)
+    expect((await engine.attemptView(approved.attempt.id)).promotion)
+      .toMatchObject({ status: 'diverged', eligible: false })
+  })
+
+  it('refuses promotion text that SQLite could not store unchanged', async () => {
+    const approved = await approvedAttempt()
+    // An unpaired UTF-16 surrogate is stored by SQLite as U+FFFD, so text
+    // hashed before the write could never match the text read back. A Promotion
+    // carrying one would create its ref and then fail its own integrity check
+    // forever, reporting invalid authority over a real durable output.
+    const lone = 'promote\ud800now'
+    expect(lone.isWellFormed()).toBe(false)
+
+    await expect(engine.promote({
+      attemptId: approved.attempt.id,
+      actor: 'operator',
+      rationale: lone,
+      expectedReviewDigest: approved.promotion.reviewDigest as string,
+    })).rejects.toMatchObject<Partial<ForgeyardDomainError>>({ code: 'INVALID_REQUEST' })
+
+    // Refused before anything durable exists, and the Attempt stays promotable.
+    expect(store.promotions(approved.attempt.id)).toEqual([])
+    expect(await engine.git.readPromotionRef(repositoryPath, GitAuthority.promotionRef(approved.attempt.id)))
+      .toBeNull()
+    expect((await engine.attemptView(approved.attempt.id)).promotion)
+      .toMatchObject({ status: 'eligible', eligible: true })
   })
 
   it('never fails a promotion another Host may still be creating', async () => {

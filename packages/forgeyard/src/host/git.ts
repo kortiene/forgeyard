@@ -1231,7 +1231,17 @@ export class GitAuthority {
     if (result.spawnError !== null || !result.stdout.complete || !result.stderr.complete) {
       throw new Error('the Forgeyard promotion ref could not be read completely')
     }
-    if (result.exitCode === 1 && result.stdout.text.trim() === '') return null
+    if (result.exitCode === 1 && result.stdout.text.trim() === '') {
+      // Exit 1 with empty stdout means "no such ref" only when Git also said
+      // nothing. A ref file holding a malformed object name exits identically
+      // but warns `ignoring broken ref` on stderr, and the namespace is still
+      // occupied: reporting that as absent would settle a pending row as "no
+      // durable output exists" and send every retry into a collision with the
+      // ref that is sitting right there.
+      const warning = result.stderr.text.trim()
+      if (warning === '') return null
+      throw new PromotionRefDisagreement(`${ref} exists but Git cannot read it: ${warning}`)
+    }
     if (result.exitCode !== 0) throw new Error(`git rev-parse failed for ${ref}: ${result.stderr.text.trim()}`)
     const oid = cleanLine(result.stdout.text)
     if (!/^[0-9a-f]{40,64}$/u.test(oid)) {
@@ -1243,10 +1253,16 @@ export class GitAuthority {
     //
     // `cat-file -e` proves only that the commit object itself is present; it
     // does not traverse the tree, so a pruned blob would pass it. `rev-list
-    // --objects` walks the commit's whole object graph in one command and fails
-    // if any of it is missing, peels a non-commit, and with `--quiet` prints
-    // nothing, so a large deliverable cannot overrun the capture limit.
-    const object = await this.invoke(cwd, ['rev-list', '--objects', '--no-walk', '--quiet', `${oid}^{commit}`])
+    // --objects` walks the whole object graph in one command and fails if any
+    // of it is missing, peels a non-commit, and with `--quiet` prints nothing,
+    // so a large deliverable cannot overrun the capture limit.
+    //
+    // `--max-count=2` rather than `--no-walk`: the promotion commit names a
+    // frozen base parent, and `--no-walk` would not follow that edge, so a
+    // pruned base commit still read as a durable output while `git show` on it
+    // failed. Two is the promotion and its one parent — enough to prove the
+    // edge the record claims, without walking the repository's whole history.
+    const object = await this.invoke(cwd, ['rev-list', '--objects', '--quiet', '--max-count=2', `${oid}^{commit}`])
     if (object.spawnError !== null || !object.stderr.complete) {
       throw new Error('the Forgeyard promotion commit could not be inspected completely')
     }

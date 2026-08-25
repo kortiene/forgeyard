@@ -108,6 +108,14 @@ function requiredText(name: string, value: string, max = 20_000): string {
   const text = value.trim()
   if (text.length === 0) throw new ForgeyardDomainError('INVALID_REQUEST', `${name} is required`)
   if (Buffer.byteLength(text) > max) throw new ForgeyardDomainError('INVALID_REQUEST', `${name} is too large`)
+  // SQLite stores an unpaired UTF-16 surrogate as U+FFFD. Text hashed before
+  // that write can therefore never match the text read back, so a Promotion
+  // carrying one would create its durable Git ref and then fail its own
+  // integrity check forever — reporting invalid authority over a real output.
+  // Refusing the input is the only point at which that is still recoverable.
+  if (!text.isWellFormed()) {
+    throw new ForgeyardDomainError('INVALID_REQUEST', `${name} contains unpaired UTF-16 surrogates`)
+  }
   return text
 }
 
