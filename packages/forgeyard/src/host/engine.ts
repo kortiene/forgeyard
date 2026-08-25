@@ -28,7 +28,14 @@ import type {
 import { parseCommandLine } from './command-line.ts'
 import type { TrustedEvidenceCollector } from './evidence.ts'
 import type { SessionGateway } from './execution.ts'
-import { GitAuthority, type CanonicalRepository, type PreparedWorktree, type PromotionGitView } from './git.ts'
+import {
+  GitAuthority,
+  PromotionRefDisagreement,
+  RepositoryIdentityMismatch,
+  type CanonicalRepository,
+  type PreparedWorktree,
+  type PromotionGitView,
+} from './git.ts'
 import { canonicalJson, forgeyardId, hashRecord, sha256 } from './hash.ts'
 import { assertTreeMatchesProjection, PromotionProjector, type PromotionProjectionResult } from './promotion.ts'
 import {
@@ -994,12 +1001,25 @@ export class ForgeyardEngine {
    * Forgeyard never infers success and never rewrites an existing ref.
    */
   async reconcilePromotions(): Promise<number> {
-    return this.enqueue(() => this.reconcilePromotionsUnqueued(null))
+    // Deliberately not held inside the engine's mutation queue. Probing a
+    // repository costs bounded Git commands — 120s each on the shipped config —
+    // and this pass is fire-and-forget background recovery that can meet several
+    // stalled repositories in a row. Holding the queue across that would make
+    // every later Remote request wait behind it, including the Cockpit's first
+    // `snapshot`, so a Host recovering quietly would look like a Host that is
+    // down. Only the settlements take the queue, and each is one synchronous
+    // SQLite write.
+    try {
+      return await this.reconcilePending(null, write => this.enqueue(async () => write()))
+    } finally {
+      this.scheduleLeaseReconciliation()
+    }
   }
 
   private async reconcilePromotionsUnqueued(attemptId: AttemptId | null): Promise<number> {
     try {
-      return await this.reconcilePending(attemptId)
+      // Already inside the queue: settle inline rather than deadlocking on it.
+      return await this.reconcilePending(attemptId, write => write())
     } finally {
       // Armed on every exit path. A pass that rejects — SQLite write contention
       // with another Host, say — has already consumed the only timer, and the
@@ -1008,7 +1028,10 @@ export class ForgeyardEngine {
     }
   }
 
-  private async reconcilePending(attemptId: AttemptId | null): Promise<number> {
+  private async reconcilePending(
+    attemptId: AttemptId | null,
+    settle: (write: () => 'settled' | 'agreed' | 'conflicted') => Promise<'settled' | 'agreed' | 'conflicted'> | 'settled' | 'agreed' | 'conflicted',
+  ): Promise<number> {
     const now = Date.now()
     const pending = this.store.pendingPromotions()
       .filter(record => attemptId === null || record.attemptId === attemptId)
@@ -1033,27 +1056,28 @@ export class ForgeyardEngine {
         continue
       }
       let observed: string | null
-      let symbolic: string | null = null
+      let broken: string | null = null
       try {
         const repository = await this.git.canonicalize(attempt.executionSnapshot.repository.path)
         this.git.assertRepositorySnapshot(repository, attempt.executionSnapshot.repository)
-        // A symref at the promotion name is not transient unreadability. It is
-        // proof that no Forgeyard-owned output exists there, because Forgeyard
-        // only ever creates a direct ref and refuses to write through a symref.
-        // Treating it as unreadable would repeat this pass forever and keep the
-        // Attempt blocked with no operator gesture able to reach it.
-        symbolic = await this.git.promotionSymrefTarget(repository.path, promotion.outputRef)
-        observed = symbolic !== null ? null : await this.git.readPromotionRef(repository.path, promotion.outputRef)
-      } catch {
-        // The repository is unreadable right now. The Promotion stays pending
-        // and the Cockpit reports it as uncertain rather than guessing.
-        continue
+        observed = await this.git.readPromotionRef(repository.path, promotion.outputRef)
+      } catch (error) {
+        // A ref that is present but provably unusable — a symref, an unreadable
+        // object graph — will not become usable by looking again. Leaving it
+        // pending repeats this pass forever and keeps the Attempt blocked with
+        // no operator gesture able to reach it, so it is settled and released.
+        // A repository that is not the recorded one is deliberately *not* in
+        // that class: the recorded output may still exist wherever the original
+        // repository went, so claiming no durable output exists would be a guess.
+        if (!(error instanceof PromotionRefDisagreement)) continue
+        observed = null
+        broken = errorText(error)
       }
-      const wrote = symbolic !== null
+      const wrote = await settle(() => broken !== null
         ? this.settleReconciled(
           promotion.id,
           'failed',
-          `${promotion.outputRef} is a symbolic ref to ${symbolic}, so no Forgeyard-owned output exists at that name. Remove it before promoting this Attempt again.`,
+          `No usable Forgeyard-owned output exists at ${promotion.outputRef}: ${broken}. Resolve it before promoting this Attempt again.`,
         )
         : observed === promotion.outputCommit
         ? this.settleReconciled(promotion.id, 'promoted', null)
@@ -1067,7 +1091,7 @@ export class ForgeyardEngine {
             promotion.id,
             'failed',
             `${promotion.outputRef} already resolves to ${observed} instead of this promotion's commit ${promotion.outputCommit}. Inspect the ref before promoting again.`,
-          )
+          ))
       if (wrote === 'settled') settled += 1
       else if (wrote === 'conflicted') {
         // Two Hosts proved opposite things about one ref. Counting this as an
@@ -1116,9 +1140,13 @@ export class ForgeyardEngine {
       outputCommit: active?.outputCommit ?? null,
       failureReason: (active ?? promotions.at(-1))?.failureReason ?? null,
     }
-    if (active !== undefined) {
+    // Every retained Promotion is audit authority for this Attempt, including a
+    // `failed` one. Verifying only the active record would let a corrupted or
+    // hand-edited failure history sit underneath a fresh promotion written on
+    // top of it, which is exactly the state the integrity check exists to block.
+    for (const record of promotions) {
       try {
-        assertPromotionRecordIntegrity(active)
+        assertPromotionRecordIntegrity(record)
       } catch (error) {
         return { ...base, reason: `The recorded Promotion authority is invalid: ${errorText(error)}` }
       }
@@ -1142,8 +1170,19 @@ export class ForgeyardEngine {
         symbolic = await this.git.promotionSymrefTarget(repository.path, active.outputRef)
         observed = symbolic !== null ? null : await this.git.readPromotionRef(repository.path, active.outputRef)
       } catch (error) {
-        // Unreadable right now is not the same as diverged, and is not asserted
-        // as either. The record stands and says it was not re-verified.
+        // A repository that is not the recorded one, and a ref that is present
+        // but provably unusable, are both settled questions: looking again will
+        // not change them, and continuing to advertise a green promoted output
+        // over either would be a claim Forgeyard cannot support.
+        if (error instanceof RepositoryIdentityMismatch || error instanceof PromotionRefDisagreement) {
+          return {
+            ...base,
+            status: 'diverged',
+            reason: `This Attempt was promoted to ${active.outputRef} at ${active.outputCommit}, but that output no longer holds: ${errorText(error)}`,
+          }
+        }
+        // Unreadable right now is a different thing, and is not asserted as
+        // either. The record stands and says it was not re-verified.
         return {
           ...base,
           status: 'promoted',

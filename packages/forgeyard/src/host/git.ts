@@ -17,6 +17,21 @@ import { bounded, type ProcessResult, type ProcessRunner } from './process.ts'
 
 export type { RawWorkspaceManifest, WorkspaceManifestEntry } from '../types.ts'
 
+/**
+ * A promotion output that is present but provably not what its record claims —
+ * a symbolic ref, an unreadable object graph, an invalid object name. It will
+ * not resolve by looking again, so it is reported and settled rather than
+ * retried like an I/O failure.
+ */
+export class PromotionRefDisagreement extends Error {}
+
+/**
+ * The repository at the recorded path is not the one a record refers to. Also
+ * definitive, but it is not a statement about the ref: the recorded output may
+ * still exist in the original repository, wherever that now is.
+ */
+export class RepositoryIdentityMismatch extends Error {}
+
 export interface GitAuthorityConfig {
   allowedRepositoryRoots: readonly string[]
   worktreeRoot: string
@@ -573,7 +588,7 @@ export class GitAuthority {
     if (top.dev !== repository.device || top.ino !== repository.inode
       || gitDir.dev !== repository.gitDirDevice || gitDir.ino !== repository.gitDirInode
       || commonDir.dev !== repository.commonDirDevice || commonDir.ino !== repository.commonDirInode) {
-      throw new Error('repository identity on disk differs from the canonicalized repository')
+      throw new RepositoryIdentityMismatch('repository identity on disk differs from the canonicalized repository')
     }
   }
 
@@ -581,7 +596,7 @@ export class GitAuthority {
     const current = this.repositoryIdentitySnapshot(repository, snapshot.baseRef)
     const { checkoutHead: _head, checkoutStatusHash: _status, ...identity } = snapshot
     if (canonicalJson(current) !== canonicalJson(identity)) {
-      throw new Error('repository identity differs from the durable Mission snapshot')
+      throw new RepositoryIdentityMismatch('repository identity differs from the durable Mission snapshot')
     }
   }
 
@@ -1151,6 +1166,12 @@ export class GitAuthority {
       // Signing would make the commit name depend on a key and a clock, so the
       // deterministic promotion identity is the only authorship claim made.
       '-c', 'commit.gpgsign=false',
+      // A repository-local `i18n.commitEncoding` adds an `encoding` header and
+      // changes the commit's object name for the same tree, parent, message,
+      // identity, and date. Ambient configuration must not decide what a
+      // promotion is called: the whole recovery story depends on a retry
+      // recomputing the same commit as the attempt that preceded it.
+      '-c', 'i18n.commitEncoding=UTF-8',
       'commit-tree', tree, '-p', parent, '-m', message,
     ], env))
     if (!/^[0-9a-f]{40,64}$/u.test(commit)) throw new Error('Git returned an invalid promotion commit object name')
@@ -1202,7 +1223,9 @@ export class GitAuthority {
     // never creates one, so finding one is a disagreement, not an output.
     const symbolic = await this.promotionSymrefTarget(cwd, ref)
     if (symbolic !== null) {
-      throw new Error(`${ref} is a symbolic ref to ${symbolic}; Forgeyard never creates one and will not read through it`)
+      throw new PromotionRefDisagreement(
+        `${ref} is a symbolic ref to ${symbolic}; Forgeyard never creates one and will not read through it`,
+      )
     }
     const result = await this.invoke(cwd, ['rev-parse', '--verify', '--quiet', '--end-of-options', ref])
     if (result.spawnError !== null || !result.stdout.complete || !result.stderr.complete) {
@@ -1211,7 +1234,9 @@ export class GitAuthority {
     if (result.exitCode === 1 && result.stdout.text.trim() === '') return null
     if (result.exitCode !== 0) throw new Error(`git rev-parse failed for ${ref}: ${result.stderr.text.trim()}`)
     const oid = cleanLine(result.stdout.text)
-    if (!/^[0-9a-f]{40,64}$/u.test(oid)) throw new Error(`Git returned an invalid object name for ${ref}`)
+    if (!/^[0-9a-f]{40,64}$/u.test(oid)) {
+      throw new PromotionRefDisagreement(`Git returned an invalid object name for ${ref}`)
+    }
     // `rev-parse --verify` answers from the ref's text alone: a ref left behind
     // by a damaged or pruned object database still reports its recorded object
     // name. A promoted output nothing can check out is not a durable output.
@@ -1226,7 +1251,7 @@ export class GitAuthority {
       throw new Error('the Forgeyard promotion commit could not be inspected completely')
     }
     if (object.exitCode !== 0) {
-      throw new Error(
+      throw new PromotionRefDisagreement(
         `${ref} names ${oid}, but that commit and its promoted objects are not all readable in this repository`,
       )
     }

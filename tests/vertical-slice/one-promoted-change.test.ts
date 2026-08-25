@@ -828,8 +828,11 @@ describe('Milestone 2: one promoted change', () => {
 
     await expect(engine.git.readPromotionRef(repositoryPath, record.outputRef))
       .rejects.toThrow(/not all readable in this repository/u)
+    // A settled question, not a transient read: it must stop rendering as a
+    // green promoted output.
     const damaged = await engine.attemptView(approved.attempt.id)
-    expect(damaged.promotion.reason).toMatch(/could not be confirmed/u)
+    expect(damaged.promotion).toMatchObject({ status: 'diverged', eligible: false })
+    expect(damaged.promotion.reason).toMatch(/that output no longer holds/u)
     expect(damaged.promotion.reason).toMatch(/not all readable in this repository/u)
   })
 
@@ -848,8 +851,8 @@ describe('Milestone 2: one promoted change', () => {
 
     await expect(engine.git.readPromotionRef(repositoryPath, record.outputRef))
       .rejects.toThrow(/not all readable in this repository/u)
-    expect((await engine.attemptView(approved.attempt.id)).promotion.reason)
-      .toMatch(/could not be confirmed/u)
+    expect((await engine.attemptView(approved.attempt.id)).promotion)
+      .toMatchObject({ status: 'diverged', eligible: false })
   })
 
   it('surfaces an opposite settlement instead of reporting success over it', async () => {
@@ -955,7 +958,8 @@ describe('Milestone 2: one promoted change', () => {
     expect(await gitText(repositoryPath, ['git', 'rev-parse', record.outputRef])).toBe(record.outputCommit)
 
     const view = await engine.attemptView(approved.attempt.id)
-    expect(view.promotion.reason).toMatch(/could not be confirmed/u)
+    expect(view.promotion).toMatchObject({ status: 'diverged', eligible: false })
+    expect(view.promotion.reason).toMatch(/that output no longer holds/u)
     expect(view.promotion.reason).toMatch(/repository identity differs/u)
   })
 
@@ -1114,6 +1118,58 @@ describe('Milestone 2: one promoted change', () => {
     } finally {
       countingStore.close()
     }
+  })
+
+  it('blocks promotion when a retained failed Promotion no longer verifies', async () => {
+    const approved = await approvedAttempt()
+    const decision = approved.decisions[0] as DecisionRecord
+    // A failed row is retained audit authority. Verifying only the active
+    // record would let a corrupted failure history sit underneath a fresh
+    // promotion written on top of it.
+    const record = await pendingPromotion(approved.attempt, decision, approved.attempt.baseCommit)
+    store.settlePromotion(record.id, 'failed', 'released so the Attempt is promotable again')
+    expect((await engine.attemptView(approved.attempt.id)).promotion)
+      .toMatchObject({ status: 'eligible', eligible: true })
+
+    store.database.exec('DROP TRIGGER promotions_authority_immutable')
+    store.database.prepare('UPDATE promotions SET output_commit=? WHERE id=?').run('0'.repeat(40), record.id)
+
+    const tampered = await engine.attemptView(approved.attempt.id)
+    expect(tampered.promotion).toMatchObject({ status: 'blocked', eligible: false })
+    expect(tampered.promotion.reason).toMatch(/recorded Promotion authority is invalid/u)
+    await expect(promote(approved)).rejects.toMatchObject<Partial<ForgeyardDomainError>>({ code: 'PROMOTION_BLOCKED' })
+  })
+
+  it('does not hold the engine queue while background reconciliation probes Git', async () => {
+    const approved = await approvedAttempt()
+    const decision = approved.decisions[0] as DecisionRecord
+    await pendingPromotion(approved.attempt, decision, approved.attempt.baseCommit)
+
+    let release = (): void => {}
+    const stalled = new Promise<void>((resolve) => { release = resolve })
+    let stalling = false
+    const read = engine.git.readPromotionRef.bind(engine.git)
+    // A repository whose Git commands stall. At the shipped 120s timeout a few
+    // of these in a row is minutes; a Host recovering quietly must not look
+    // like a Host that is down.
+    engine.git.readPromotionRef = async (cwd, ref) => {
+      stalling = true
+      await stalled
+      return read(cwd, ref)
+    }
+
+    const pass = engine.reconcilePromotions()
+    await vi.waitFor(() => { expect(stalling).toBe(true) }, { timeout: 5_000, interval: 10 })
+
+    // The queue must still serve requests while that probe is outstanding.
+    const view = await Promise.race([
+      engine.attemptView(approved.attempt.id).then(() => 'served' as const),
+      new Promise<'blocked'>((resolve) => { setTimeout(() => { resolve('blocked') }, 2_000).unref?.() }),
+    ])
+    expect(view).toBe('served')
+
+    release()
+    await pass
   })
 
   it('never fails a promotion another Host may still be creating', async () => {

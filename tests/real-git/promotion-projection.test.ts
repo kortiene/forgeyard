@@ -136,6 +136,20 @@ describe('real Git promotion projection', () => {
     const first = await git.createPromotionCommit(prepared, written.tree, prepared.baseCommit, 'forgeyard: promote\n', IDENTITY)
     const second = await git.createPromotionCommit(prepared, written.tree, prepared.baseCommit, 'forgeyard: promote\n', IDENTITY)
     expect(second).toBe(first)
+
+    // Ambient repository configuration must not decide what a promotion is
+    // called. `i18n.commitEncoding` adds an `encoding` header and changes the
+    // object name for the same tree, parent, message, identity, and date, which
+    // would break the retry-recomputes-the-same-commit recovery story.
+    await run(runtime.runner, prepared.repository.path, ['git', 'config', '--local', 'i18n.commitEncoding', 'ISO-8859-1'])
+    try {
+      const encoded = await git.createPromotionCommit(
+        prepared, written.tree, prepared.baseCommit, 'forgeyard: promote\n', IDENTITY,
+      )
+      expect(encoded).toBe(first)
+    } finally {
+      await run(runtime.runner, prepared.repository.path, ['git', 'config', '--local', '--unset', 'i18n.commitEncoding'])
+    }
     expect(await git.readCommitTree(prepared, first)).toBe(written.tree)
 
     // Rebuilding the same reviewed state must reproduce the identical objects.

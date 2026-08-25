@@ -219,6 +219,32 @@ out a lease that could not teach it anything more. Reconciliation settles such a
 row for the same reason, rather than treating the rejection as a repository it
 cannot read and repeating the pass forever.
 
+Forgeyard distinguishes a settled question from one it merely cannot answer yet.
+A repository that is not the recorded one, and a ref that is present but provably
+unusable, are both definitive: looking again will not change them. They are
+reported as `diverged` rather than continuing to advertise a promoted output, and
+a pending row in the second class is settled and released rather than retried
+forever. A repository it simply cannot read right now is neither, and is reported
+as unconfirmed. The distinction is carried by typed errors rather than by
+matching on messages.
+
+Every retained Promotion is audit authority, including a `failed` one, so all of
+them are integrity-checked before an Attempt is promotable again — a corrupted
+failure history must not sit underneath a fresh promotion.
+
+Background reconciliation does not hold the engine's mutation queue while it
+probes Git. Only its settlements take the queue. A recovery pass can meet several
+stalled repositories in a row, each command bounded at 120s, and holding the
+queue across that would leave every Remote request — including the Cockpit's
+first snapshot — waiting behind it, so a Host recovering quietly would look like
+a Host that is down.
+
+The promotion commit pins `i18n.commitEncoding=UTF-8` alongside disabling
+signing. A repository-local encoding adds an `encoding` header and changes the
+object name for the same tree, parent, message, identity, and date; ambient
+configuration must not decide what a promotion is called, because the recovery
+story depends on a retry recomputing exactly the commit that preceded it.
+
 Nor is a ref believed because its commit object exists: `cat-file -e` proves only
 that one object is present, so a pruned tree or blob beneath it would still be
 advertised as a durable output. The commit's whole object graph is walked instead.
