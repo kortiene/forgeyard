@@ -1,7 +1,8 @@
 # Milestone 3 proposal — One Useful Pipe
 
-- Status: **Proposed, not implemented.** This document exists to resolve design
-  questions *before* code, per the Milestone 3 mandate.
+- Status: **Partially implemented in bounded slices.** The plural Mission view is
+  merged; serial one-/two-node creation and atomic Task materialization are in
+  progress. Dependency satisfaction and promoted-base execution remain pending.
 - DSH release: `0.1.1-rc.2` (`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`) — unchanged.
 - Revision 3. Five P1 findings from automated review were verified against the
   implementation and **all five were correct**; see [Corrections](#corrections-in-revision-2).
@@ -20,13 +21,14 @@ Milestones 1 and 2 proved the execution and governance architecture:
 Decision → Promotion`. What they did **not** prove is that Forgeyard is a
 *workspace* rather than a single-attempt review tool.
 
-The honest gap: `PipeSnapshot` exists but `createMission` hard-codes one
-`implement` node in `ForgeyardEngine.createMission` and materializes exactly
-one Task with `dependencies: []`. Nothing reads `dependencies` — a grep
-across `src/host` finds only the write path in `store.ts` and the schema in
-`migrations.ts`. There is no readiness calculation, no scheduling, and no output
-propagation. `MissionCreateRequest` exposes a single `verificationCommand` even
-though `VerificationRequirement[]` can already represent several.
+At proposal time, `createMission` hard-coded one `implement` node and
+materialized exactly one Task. The first slice replaced the singular public view
+with ordered `TaskNodeView[]`. The second slice accepts and atomically
+materializes one root or one root plus one direct serial follow-up, with an
+explicit frozen edge and per-node verifier. The remaining honest gap is
+**dependency satisfaction and output propagation**: B stays blocked until
+Forgeyard can re-verify A's promoted output and freeze that exact commit as B's
+base.
 
 Milestone 3 closes exactly that gap for **two serial nodes** and stops.
 
@@ -327,6 +329,47 @@ is reviewable in isolation and CI proves the single-node path is unchanged under
 the new shape. An existing one-node Mission becomes a one-element `tasks` array
 with `dependsOn: []` and a rollup equal to that node's state — exactly today's
 truth.
+
+### 7. Bounded serial creation contract (implementation slice 2)
+
+The public create request now carries an explicit node array instead of singular
+`task` / `verificationCommand` fields:
+
+```ts
+interface MissionNodeRequest {
+  key: string
+  task: string
+  verificationCommand: string
+  dependsOn: string[]
+}
+
+interface MissionCreateRequest {
+  title: string
+  objective: string
+  repositoryPath: string
+  baseRef: string
+  nodes: MissionNodeRequest[] // exactly one root, or root + direct follow-up
+  // Mission-level policy overrides remain unchanged.
+}
+```
+
+This is deliberately **not** a generalized DAG API. Every new request must carry
+one or two nodes; the root has `dependsOn: []`, and a second node must carry
+exactly `[root.key]`. Keys are unique after trimming. Every node freezes one
+independently parsed direct-argv verifier. All arity, text, key, edge, and command
+validation happens before Git or provider-policy work.
+
+A single `BEGIN IMMEDIATE` inserts the Mission and every Task, and the store
+asserts the Pipe hash, one-to-one node/Task mapping, specification
+correspondence, and dependency-ID correspondence before writing. No SQL
+migration is needed: `missions.pipe_json`, `tasks.source_node_key`, and
+`tasks.dependencies_json` already carry the authority.
+
+Both nodes inherit the one frozen Mission policy. The root is startable; a real
+follow-up is visible as `blocked` with its upstream key surfaced, and Host
+admission remains fail-closed on both initial and Retry paths. Re-verifying the
+upstream Promotion, satisfying readiness, and propagating its exact commit as
+the follow-up base belong to the next slice.
 
 ## Acceptance criteria
 

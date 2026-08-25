@@ -114,6 +114,102 @@ describe('built Forgeyard browser face', () => {
     for (const cleanup of cleanups.reverse()) cleanup()
   })
 
+  it('submits one explicit dependency-free root when no follow-up is requested', async () => {
+    const client = await executeBuiltClientFace()
+    const entries = new Map<string, SlotEntry>()
+    const cleanups: Array<() => void> = []
+    const data = snapshotFixture()
+    const result = <T,>(value: T) => Promise.resolve({ ok: true, value: { ok: true, value } })
+    const createMission = vi.fn(() => result(data.missions[0]))
+    const ctx = fakeClientContext(entries, cleanups, data, result, { createMission })
+
+    await act(async () => { await client.apply(ctx as never) })
+    const footer = await mount(<Slot entry={required(entries, 'sidebar.footer.action')} runtime={{ wide: true }} />)
+    const overlay = await mount(<Slot entry={required(entries, 'shell.overlay')} />)
+    await click(await waitForElement(() => namedButton(footer.container, /Open Forgeyard/u)))
+    await click(requiredElement(namedButton(overlay.container, /New mission/u), 'new Mission button'))
+    await type(requiredField(overlay.container, 'Title'), 'Root Mission')
+    await type(requiredField(overlay.container, 'Objective'), 'Create one root node.')
+    await type(requiredField(overlay.container, 'Repository'), '/tmp/repository')
+    await type(requiredField(overlay.container, 'Base ref'), 'main')
+    await type(requiredField(overlay.container, 'Root verify'), 'node verify.mjs')
+    await type(requiredField(overlay.container, 'Root node · implement'), 'Implement the root.')
+
+    const form = requiredElement(overlay.container.querySelector<HTMLFormElement>('form.fy-form'), 'Mission form')
+    await act(async () => { form.requestSubmit() })
+    await waitFor(() => createMission.mock.calls.length === 1)
+    expect(createMission.mock.calls[0]?.[0].nodes).toEqual([{
+      key: 'implement',
+      task: 'Implement the root.',
+      verificationCommand: 'node verify.mjs',
+      dependsOn: [],
+    }])
+
+    await overlay.unmount()
+    await footer.unmount()
+    for (const cleanup of cleanups.reverse()) cleanup()
+  })
+
+  it('submits one explicit root plus one optional serial follow-up from the Cockpit', async () => {
+    const client = await executeBuiltClientFace()
+    const entries = new Map<string, SlotEntry>()
+    const cleanups: Array<() => void> = []
+    const data = snapshotFixture()
+    const result = <T,>(value: T) => Promise.resolve({ ok: true, value: { ok: true, value } })
+    const createMission = vi.fn(() => result(data.missions[0]))
+    const ctx = fakeClientContext(entries, cleanups, data, result, { createMission })
+
+    await act(async () => { await client.apply(ctx as never) })
+    const footer = await mount(<Slot entry={required(entries, 'sidebar.footer.action')} runtime={{ wide: true }} />)
+    const overlay = await mount(<Slot entry={required(entries, 'shell.overlay')} />)
+    await click(await waitForElement(() => namedButton(footer.container, /Open Forgeyard/u)))
+    await waitForElement(() => overlay.container.querySelector('[role="dialog"]'))
+    await click(requiredElement(namedButton(overlay.container, /New mission/u), 'new Mission button'))
+
+    await type(requiredField(overlay.container, 'Title'), 'Serial Mission')
+    await type(requiredField(overlay.container, 'Objective'), 'Prove explicit serial Pipe creation.')
+    await type(requiredField(overlay.container, 'Repository'), '/tmp/repository')
+    await type(requiredField(overlay.container, 'Base ref'), 'main')
+    await type(requiredField(overlay.container, 'Root verify'), 'node verify-a.mjs')
+    await type(requiredField(overlay.container, 'Root node · implement'), 'Implement A.')
+    await click(requiredElement(namedButton(overlay.container, /Add serial follow-up node/u), 'follow-up toggle'))
+    await type(requiredField(overlay.container, 'Follow-up node · follows implement'), 'Implement B.')
+    await type(requiredField(overlay.container, 'Follow-up verify'), 'node verify-b.mjs')
+
+    const form = requiredElement(overlay.container.querySelector<HTMLFormElement>('form.fy-form'), 'Mission form')
+    await act(async () => { form.requestSubmit() })
+    await waitFor(() => createMission.mock.calls.length === 1)
+    expect(createMission).toHaveBeenCalledWith({
+      title: 'Serial Mission',
+      objective: 'Prove explicit serial Pipe creation.',
+      repositoryPath: '/tmp/repository',
+      baseRef: 'main',
+      nodes: [
+        {
+          key: 'implement',
+          task: 'Implement A.',
+          verificationCommand: 'node verify-a.mjs',
+          dependsOn: [],
+        },
+        {
+          key: 'follow-up',
+          task: 'Implement B.',
+          verificationCommand: 'node verify-b.mjs',
+          dependsOn: ['implement'],
+        },
+      ],
+      provider: null,
+      model: null,
+      reasoningEffort: null,
+      agentPreset: null,
+      permissionPreset: null,
+    })
+
+    await overlay.unmount()
+    await footer.unmount()
+    for (const cleanup of cleanups.reverse()) cleanup()
+  })
+
   it('renders promotion eligibility, requires explicit confirmation, and shows the durable result', async () => {
     const client = await executeBuiltClientFace()
     const entries = new Map<string, SlotEntry>()
@@ -299,6 +395,21 @@ async function waitForElement<T extends Element>(read: () => T | null): Promise<
     await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
   }
   throw new Error('expected browser element did not render')
+}
+
+async function waitFor(read: () => boolean): Promise<void> {
+  for (let index = 0; index < 50; index += 1) {
+    if (read()) return
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
+  }
+  throw new Error('expected browser condition did not become true')
+}
+
+function requiredField(container: ParentNode, label: string): HTMLInputElement | HTMLTextAreaElement {
+  const field = [...container.querySelectorAll<HTMLLabelElement>('label.fy-field')]
+    .find(candidate => candidate.querySelector('span')?.textContent === label)
+    ?.querySelector<HTMLInputElement | HTMLTextAreaElement>('input,textarea')
+  return requiredElement(field ?? null, `field ${label}`)
 }
 
 function namedButton(container: ParentNode, name: RegExp): HTMLButtonElement | null {

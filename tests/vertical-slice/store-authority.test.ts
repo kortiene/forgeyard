@@ -149,6 +149,127 @@ describe('Forgeyard SQLite authority migration and retry transaction', () => {
     }
   })
 
+  it('atomically materializes one Task per frozen serial Pipe node', async () => {
+    const path = await databasePath('serial-pipe')
+    const store = new ForgeyardStore(path)
+    try {
+      const { mission, tasks } = serialFixtures()
+      store.insertMissionAndTasks(mission, tasks)
+      expect(store.mission(mission.id)).toEqual(mission)
+      const stored = store.tasksForMission(mission.id)
+      expect(stored).toHaveLength(2)
+      expect(new Map(stored.map(task => [task.sourceNodeKey, task]))).toEqual(
+        new Map(tasks.map(task => [task.sourceNodeKey, task])),
+      )
+      expect(stored.find(task => task.sourceNodeKey === 'root')?.dependencies).toEqual([])
+      expect(stored.find(task => task.sourceNodeKey === 'follow-up')?.dependencies).toEqual([tasks[0].id])
+    } finally {
+      store.close()
+    }
+  })
+
+  it('rejects inconsistent Pipe/Task authority before writing any row', async () => {
+    const path = await databasePath('serial-pipe-invalid')
+    const store = new ForgeyardStore(path)
+    try {
+      const fixture = serialFixtures()
+      const duplicateKeyPipe = {
+        nodes: [fixture.mission.pipe.nodes[0], {
+          ...fixture.mission.pipe.nodes[1], key: fixture.mission.pipe.nodes[0]?.key as string,
+        }],
+      }
+      const invalidEdgePipe = {
+        nodes: [fixture.mission.pipe.nodes[0], { ...fixture.mission.pipe.nodes[1], dependsOn: [] }],
+      }
+      const cases: Array<{ label: string; mission: MissionRecord; tasks: TaskRecord[]; message: RegExp }> = [
+        {
+          label: 'no Tasks',
+          mission: fixture.mission,
+          tasks: [],
+          message: /one Task per one- or two-node Pipe/u,
+        },
+        {
+          label: 'Task count mismatch',
+          mission: fixture.mission,
+          tasks: [fixture.tasks[0]],
+          message: /one Task per one- or two-node Pipe/u,
+        },
+        {
+          label: 'duplicate Pipe node key',
+          mission: { ...fixture.mission, pipe: duplicateKeyPipe, pipeHash: hashRecord(duplicateKeyPipe) },
+          tasks: fixture.tasks,
+          message: /Pipe node key .* duplicated/u,
+        },
+        {
+          label: 'non-serial Pipe edge',
+          mission: { ...fixture.mission, pipe: invalidEdgePipe, pipeHash: hashRecord(invalidEdgePipe) },
+          tasks: fixture.tasks,
+          message: /follow-up Pipe node must depend exactly/u,
+        },
+        {
+          label: 'invalid Pipe hash',
+          mission: { ...fixture.mission, pipeHash: '0'.repeat(64) },
+          tasks: fixture.tasks,
+          message: /Pipe hash is invalid/u,
+        },
+        {
+          label: 'wrong Mission',
+          mission: fixture.mission,
+          tasks: [fixture.tasks[0], { ...fixture.tasks[1], missionId: 'mission_other' }],
+          message: /different Mission/u,
+        },
+        {
+          label: 'duplicate node key',
+          mission: fixture.mission,
+          tasks: [fixture.tasks[0], { ...fixture.tasks[1], sourceNodeKey: fixture.tasks[0].sourceNodeKey }],
+          message: /Task node key .* duplicated/u,
+        },
+        {
+          label: 'specification mismatch',
+          mission: fixture.mission,
+          tasks: [fixture.tasks[0], {
+            ...fixture.tasks[1],
+            specification: { ...fixture.tasks[1].specification, instruction: 'Different instruction' },
+          }],
+          message: /specification does not match/u,
+        },
+        {
+          label: 'dependency mismatch',
+          mission: fixture.mission,
+          tasks: [fixture.tasks[0], { ...fixture.tasks[1], dependencies: [] }],
+          message: /dependencies do not match/u,
+        },
+      ]
+      for (const item of cases) {
+        expect(() => store.insertMissionAndTasks(item.mission, item.tasks), item.label).toThrow(item.message)
+        expect(store.missions(), item.label).toEqual([])
+        expect(store.tasksForMission(item.mission.id), item.label).toEqual([])
+      }
+    } finally {
+      store.close()
+    }
+  })
+
+  it('rolls back the Mission and first Task when a later Task insert fails', async () => {
+    const path = await databasePath('serial-pipe-rollback')
+    const store = new ForgeyardStore(path)
+    try {
+      const existing = seed(store)
+      const fixture = serialFixtures()
+      const collidingTasks: [TaskRecord, TaskRecord] = [
+        fixture.tasks[0],
+        { ...fixture.tasks[1], id: existing.task.id },
+      ]
+      expect(() => store.insertMissionAndTasks(fixture.mission, collidingTasks)).toThrow()
+      expect(store.mission(fixture.mission.id)).toBeUndefined()
+      expect(store.tasksForMission(fixture.mission.id)).toEqual([])
+      expect(store.mission(existing.mission.id)).toEqual(existing.mission)
+      expect(store.task(existing.task.id)).toEqual(existing.task)
+    } finally {
+      store.close()
+    }
+  })
+
   it('binds the raw workspace baseline with filesystem identity exactly once', async () => {
     const path = await databasePath('baseline')
     const store = new ForgeyardStore(path)
@@ -221,6 +342,9 @@ describe('Forgeyard SQLite authority migration and retry transaction', () => {
 })
 
 function fixtures(): { mission: MissionRecord; task: TaskRecord } {
+  const pipe = {
+    nodes: [{ key: 'implement', task: 'Do work', verify: [{ key: 'verify-1', command: 'true', argv: ['true'] }] }],
+  }
   const mission: MissionRecord = {
     id: 'mission_one',
     title: 'Mission',
@@ -233,8 +357,8 @@ function fixtures(): { mission: MissionRecord; task: TaskRecord } {
     },
     baseRef: 'main',
     defaultPolicy: POLICY,
-    pipe: { nodes: [{ key: 'implement', task: 'Do work', verify: [{ key: 'verify-1', command: 'true', argv: ['true'] }] }] },
-    pipeHash: 'a'.repeat(64),
+    pipe,
+    pipeHash: hashRecord(pipe),
     createdAt: 1,
   }
   const task: TaskRecord = {
@@ -251,9 +375,58 @@ function fixtures(): { mission: MissionRecord; task: TaskRecord } {
   return { mission, task }
 }
 
+function serialFixtures(): { mission: MissionRecord; tasks: [TaskRecord, TaskRecord] } {
+  const base = fixtures()
+  const verify = base.task.specification.verification
+  const pipe = {
+    nodes: [
+      { key: 'root', task: 'Do root work', verify, dependsOn: [] },
+      { key: 'follow-up', task: 'Do follow-up work', verify, dependsOn: ['root'] },
+    ],
+  }
+  const mission: MissionRecord = {
+    ...base.mission,
+    id: 'mission_serial',
+    title: 'Serial Mission',
+    objective: 'Materialize one atomic serial Pipe.',
+    pipe,
+    pipeHash: hashRecord(pipe),
+    createdAt: 2,
+  }
+  const root: TaskRecord = {
+    ...base.task,
+    id: 'task_serial_root',
+    missionId: mission.id,
+    sourceNodeKey: 'root',
+    specification: {
+      title: mission.title,
+      objective: mission.objective,
+      instruction: pipe.nodes[0].task,
+      verification: verify,
+    },
+    dependencies: [],
+    createdAt: mission.createdAt,
+  }
+  const followUp: TaskRecord = {
+    ...base.task,
+    id: 'task_serial_follow_up',
+    missionId: mission.id,
+    sourceNodeKey: 'follow-up',
+    specification: {
+      title: mission.title,
+      objective: mission.objective,
+      instruction: pipe.nodes[1].task,
+      verification: verify,
+    },
+    dependencies: [root.id],
+    createdAt: mission.createdAt,
+  }
+  return { mission, tasks: [root, followUp] }
+}
+
 function seed(store: ForgeyardStore): { mission: MissionRecord; task: TaskRecord } {
   const value = fixtures()
-  store.insertMissionAndTask(value.mission, value.task)
+  store.insertMissionAndTasks(value.mission, [value.task])
   return value
 }
 

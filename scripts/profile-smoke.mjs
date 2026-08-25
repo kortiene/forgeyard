@@ -121,8 +121,12 @@ try {
     objective: 'Prove native Session admission from an isolated Forgeyard worktree.',
     repositoryPath: repository,
     baseRef: 'main',
-    task: 'Inspect the repository and preserve its behavior.',
-    verificationCommand: 'node verify.mjs',
+    nodes: [{
+      key: 'implement',
+      task: 'Inspect the repository and preserve its behavior.',
+      verificationCommand: 'node verify.mjs',
+      dependsOn: [],
+    }],
     provider: null,
     model: null,
     reasoningEffort: null,
@@ -300,6 +304,61 @@ try {
     decisionOutcome = 'Retry/new Session/worktree plus sandbox-unavailable Attempt 2 rejection with approval and promotion blocked'
   }
 
+  // Milestone 3 slice 2: materialize a real two-node serial Pipe through the
+  // generated Remote. The follow-up is visible and blocked at both view and Host
+  // admission layers; promoted-base propagation deliberately lands next.
+  const serial = await remote('createMission', { request: {
+    title: 'Profile smoke serial Pipe',
+    objective: 'Prove atomic A -> B Task materialization before downstream execution exists.',
+    repositoryPath: repository,
+    baseRef: 'main',
+    nodes: [
+      {
+        key: 'A',
+        task: 'Inspect the repository as the upstream serial node.',
+        verificationCommand: 'node verify.mjs',
+        dependsOn: [],
+      },
+      {
+        key: 'B',
+        task: 'Perform an independent follow-up after A is approved and promoted.',
+        verificationCommand: 'node verify.mjs',
+        dependsOn: ['A'],
+      },
+    ],
+    provider: null,
+    model: null,
+    reasoningEffort: null,
+    agentPreset: null,
+    permissionPreset: null,
+  } })
+  const [serialA, serialB] = serial.tasks ?? []
+  if (serial.tasks?.length !== 2
+    || serial.mission?.pipe?.nodes?.map(node => node.key).join(',') !== 'A,B'
+    || serial.mission.pipe.nodes[0]?.dependsOn?.length !== 0
+    || serial.mission.pipe.nodes[1]?.dependsOn?.join(',') !== 'A'
+    || serialA?.task?.dependencies?.length !== 0
+    || serialB?.task?.dependencies?.join(',') !== serialA?.task?.id
+    || serialA.readiness?.status !== 'ready' || serialA.readiness?.startable !== true
+    || serialB.readiness?.status !== 'blocked' || serialB.readiness?.startable !== false
+    || serialB.readiness?.blockedBy?.join(',') !== 'A'
+    || !serialB.readiness?.reason?.includes('blocked on A')
+    || serial.derivedState !== 'ready') {
+    throw new Error(`Forgeyard did not materialize one honest serial Pipe: ${JSON.stringify(serial)}`)
+  }
+  const blockedDownstream = await invokeRemote('startAttempt', { taskId: serialB.task.id })
+  if (blockedDownstream?.ok !== false || blockedDownstream.error?.code !== 'INVALID_STATE'
+    || !blockedDownstream.error.message.includes('dependency admission and base propagation')) {
+    throw new Error(`Forgeyard admitted downstream Task B before propagated-base support: ${JSON.stringify(blockedDownstream)}`)
+  }
+  const afterSerial = await remote('snapshot', {})
+  const retainedSerial = afterSerial.missions?.find(item => item.mission?.id === serial.mission.id)
+  if (retainedSerial?.tasks?.some(item => item.attempts?.length !== 0)
+    || retainedSerial?.tasks?.length !== 2) {
+    throw new Error(`Forgeyard changed serial Pipe authority after refused admission: ${JSON.stringify(retainedSerial)}`)
+  }
+  decisionOutcome += ', plus atomic two-node Pipe materialization with downstream admission blocked'
+
   child.kill('SIGTERM')
   await Promise.race([
     once(child, 'exit'),
@@ -324,7 +383,7 @@ try {
   if (JSON.stringify(tables) !== JSON.stringify(expected)) {
     throw new Error(`Forgeyard Host schema mismatch: ${JSON.stringify(tables)}`)
   }
-  if (schemaVersion !== 3 || counts.missions !== 1 || counts.tasks !== 1 || counts.attempts !== 2) {
+  if (schemaVersion !== 3 || counts.missions !== 2 || counts.tasks !== 3 || counts.attempts !== 2) {
     throw new Error(`Forgeyard Host authority mismatch: schema=${String(schemaVersion)} counts=${JSON.stringify(counts)}`)
   }
   if (await readFile(join(repository, 'source.txt'), 'utf8') !== 'base\n') {

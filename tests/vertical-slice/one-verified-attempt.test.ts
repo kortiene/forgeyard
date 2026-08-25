@@ -31,10 +31,12 @@ class DeterministicSessionGateway implements SessionGateway {
   readonly agentClaims: string[] = []
   maintenanceCalls = 0
   sessionExistsCalls = 0
+  resolvePolicyCalls = 0
   failNextAdmission = false
   afterNextMaintenance: (() => Promise<void>) | null = null
 
   async resolvePolicy(_overrides: PolicyOverrides): Promise<ResolvedPolicySnapshot> {
+    this.resolvePolicyCalls += 1
     return structuredClone(POLICY)
   }
 
@@ -121,8 +123,12 @@ describe('Milestone 1: one verified Attempt', () => {
       objective: 'Diagnose and fix the parser without unrelated changes.',
       repositoryPath,
       baseRef: 'main',
-      task: 'Write the fixed parser result.',
-      verificationCommand: 'node verify.mjs',
+      nodes: [{
+        key: 'implement',
+        task: 'Write the fixed parser result.',
+        verificationCommand: 'node verify.mjs',
+        dependsOn: [],
+      }],
       provider: null,
       model: null,
       reasoningEffort: null,
@@ -275,7 +281,24 @@ describe('Milestone 1: one verified Attempt', () => {
       dependencies: ['task_missing_from_mission'],
       createdAt: brokenMission.createdAt,
     }
-    store.insertMissionAndTask(brokenMission, brokenTask)
+    // Bypass the validated creation seam deliberately: this test models an
+    // externally corrupted immutable row and proves the view fails soft.
+    store.immediate(() => {
+      store.database.prepare(`INSERT INTO missions
+        (id,title,objective,repository_json,base_ref,policy_json,pipe_json,pipe_hash,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?)`).run(
+        brokenMission.id, brokenMission.title, brokenMission.objective,
+        canonicalJson(brokenMission.repository), brokenMission.baseRef,
+        canonicalJson(brokenMission.defaultPolicy), canonicalJson(brokenMission.pipe),
+        brokenMission.pipeHash, brokenMission.createdAt,
+      )
+      store.database.prepare(`INSERT INTO tasks
+        (id,mission_id,source_node_key,specification_json,dependencies_json,created_at)
+        VALUES (?,?,?,?,?,?)`).run(
+        brokenTask.id, brokenTask.missionId, brokenTask.sourceNodeKey,
+        canonicalJson(brokenTask.specification), canonicalJson(brokenTask.dependencies), brokenTask.createdAt,
+      )
+    })
 
     const snapshot = await engine.snapshot()
     expect(snapshot.missions).toHaveLength(2)
@@ -299,7 +322,7 @@ describe('Milestone 1: one verified Attempt', () => {
     const pipe = {
       nodes: [
         { key: 'A', task: 'Implement A.', verify: requirement, dependsOn: [] },
-        { key: 'B', task: 'Implement B.', verify: requirement, dependsOn: [] },
+        { key: 'B', task: 'Implement B.', verify: requirement, dependsOn: ['A'] },
       ],
     }
     const orderedMission = {
@@ -310,31 +333,37 @@ describe('Milestone 1: one verified Attempt', () => {
       pipeHash: hashRecord(pipe),
       createdAt: seed.mission.createdAt + 10,
     }
-    // Deliberately insert B first and give it the earlier timestamp. A storage
-    // query ordered by created_at/id returns B,A; the public view must return A,B.
-    const taskB = {
-      ...seed.tasks[0].task,
-      id: 'task_pipe_order_b',
-      missionId: orderedMission.id,
-      sourceNodeKey: 'B',
-      specification: { ...seed.tasks[0].task.specification, title: 'B', instruction: 'Implement B.' },
-      createdAt: orderedMission.createdAt,
-    }
-    store.insertMissionAndTask(orderedMission, taskB)
     const taskA = {
       ...seed.tasks[0].task,
       id: 'task_pipe_order_a',
       missionId: orderedMission.id,
       sourceNodeKey: 'A',
-      specification: { ...seed.tasks[0].task.specification, title: 'A', instruction: 'Implement A.' },
+      specification: {
+        ...seed.tasks[0].task.specification,
+        title: orderedMission.title,
+        instruction: 'Implement A.',
+        verification: requirement,
+      },
+      dependencies: [],
       createdAt: orderedMission.createdAt + 1,
     }
-    store.database.prepare(`INSERT INTO tasks
-      (id,mission_id,source_node_key,specification_json,dependencies_json,created_at)
-      VALUES (?,?,?,?,?,?)`).run(
-      taskA.id, taskA.missionId, taskA.sourceNodeKey,
-      JSON.stringify(taskA.specification), JSON.stringify(taskA.dependencies), taskA.createdAt,
-    )
+    const taskB = {
+      ...seed.tasks[0].task,
+      id: 'task_pipe_order_b',
+      missionId: orderedMission.id,
+      sourceNodeKey: 'B',
+      specification: {
+        ...seed.tasks[0].task.specification,
+        title: orderedMission.title,
+        instruction: 'Implement B.',
+        verification: requirement,
+      },
+      dependencies: [taskA.id],
+      createdAt: orderedMission.createdAt,
+    }
+    // Deliberately insert B first and give it the earlier timestamp. The storage
+    // query returns B,A; the public view still follows the frozen Pipe as A,B.
+    store.insertMissionAndTasks(orderedMission, [taskB, taskA])
 
     expect(store.tasksForMission(orderedMission.id).map(task => task.sourceNodeKey)).toEqual(['B', 'A'])
     const view = await engine.missionView(orderedMission.id)
@@ -343,55 +372,94 @@ describe('Milestone 1: one verified Attempt', () => {
     expect(view.derivedState).toBe('ready')
   })
 
+  it('rejects every non-serial Pipe shape before Git or provider policy work', async () => {
+    const rootNode = {
+      key: 'implement', task: 'Implement the root.', verificationCommand: 'node verify.mjs', dependsOn: [],
+    }
+    const followUp = {
+      key: 'follow-up', task: 'Implement the follow-up.', verificationCommand: 'node verify.mjs', dependsOn: ['implement'],
+    }
+    const cases: Array<{ label: string; nodes: unknown; message: RegExp }> = [
+      { label: 'missing nodes', nodes: undefined, message: /one or two serial nodes/u },
+      { label: 'empty Pipe', nodes: [], message: /one or two serial nodes/u },
+      { label: 'three nodes', nodes: [rootNode, followUp, { ...followUp, key: 'third' }], message: /one or two serial nodes/u },
+      { label: 'non-object node', nodes: [null], message: /node 1 must be an object/u },
+      { label: 'non-text key', nodes: [{ ...rootNode, key: 1 }], message: /node 1 key must be text/u },
+      { label: 'blank key', nodes: [{ ...rootNode, key: '  ' }], message: /node 1 key is required/u },
+      { label: 'oversized key', nodes: [{ ...rootNode, key: 'x'.repeat(201) }], message: /node 1 key is too large/u },
+      { label: 'non-text task', nodes: [{ ...rootNode, task: null }], message: /node implement task must be text/u },
+      { label: 'non-text verifier', nodes: [{ ...rootNode, verificationCommand: [] }], message: /verification command must be text/u },
+      { label: 'missing root edge', nodes: [{ ...rootNode, dependsOn: undefined }], message: /dependsOn must be an array/u },
+      { label: 'root self dependency', nodes: [{ ...rootNode, dependsOn: ['implement'] }], message: /first serial node/u },
+      { label: 'trim-normalized duplicate keys', nodes: [rootNode, { ...followUp, key: ' implement ' }], message: /node key implement is duplicated/u },
+      { label: 'empty follow-up edge', nodes: [rootNode, { ...followUp, dependsOn: [] }], message: /second serial node/u },
+      { label: 'unknown follow-up edge', nodes: [rootNode, { ...followUp, dependsOn: ['missing'] }], message: /second serial node/u },
+      { label: 'duplicated follow-up edge', nodes: [rootNode, { ...followUp, dependsOn: ['implement', 'implement'] }], message: /second serial node/u },
+      { label: 'non-text dependency', nodes: [rootNode, { ...followUp, dependsOn: [1] }], message: /dependency 1 must be text/u },
+      {
+        label: 'invalid second verifier',
+        nodes: [rootNode, { ...followUp, verificationCommand: 'node verify.mjs | cat' }],
+        message: /node follow-up verification command is invalid.*shell syntax is not allowed/u,
+      },
+    ]
+
+    for (const item of cases) {
+      const request = {
+        ...missionRequest(),
+        repositoryPath: join(root, 'repository-must-not-be-read'),
+        nodes: item.nodes,
+      } as unknown as MissionCreateRequest
+      let failure: unknown
+      try {
+        await engine.createMission(request)
+      } catch (error) {
+        failure = error
+      }
+      expect(failure, item.label).toMatchObject<Partial<ForgeyardDomainError>>({ code: 'INVALID_REQUEST' })
+      expect(failure, item.label).toBeInstanceOf(ForgeyardDomainError)
+      expect((failure as Error).message, item.label).toMatch(item.message)
+    }
+    expect(sessions.resolvePolicyCalls).toBe(0)
+    expect(store.missions()).toEqual([])
+  })
+
   it('refuses to admit a dependency-bearing node on both the initial and the retry path', async () => {
-    // A dependency-bearing node must never execute until dependency admission and
-    // base propagation exist. The public path already refuses the initial Attempt;
-    // this also pins the Retry path, which resolves the Mission base ref and would
-    // otherwise let a seeded or persisted retryable Attempt produce a successor on
-    // the wrong base. createMission only mints dependency-free single-node Pipes
-    // today, so the two-node Mission and its retryable Attempt are seeded directly.
-    const seed = await engine.createMission(missionRequest())
-    const requirement = seed.tasks[0].task.specification.verification
-    const now = Date.now()
-    const pipe = {
-      nodes: [
-        { key: 'A', task: 'Implement A.', verify: requirement, dependsOn: [] },
-        { key: 'B', task: 'Implement B on A.', verify: requirement, dependsOn: ['A'] },
-      ],
-    }
-    const mission = {
-      ...seed.mission,
-      id: 'mission_dependency_admission_guard',
+    // Public creation now materializes the real two-node serial Pipe. Admission
+    // and base propagation are deliberately still disabled for its follow-up.
+    const mission = await engine.createMission({
+      ...missionRequest(),
       title: 'Dependency admission guard',
-      pipe,
-      pipeHash: hashRecord(pipe),
-      createdAt: now,
-    }
-    const taskA = {
-      ...seed.tasks[0].task,
-      id: 'task_dependency_guard_a',
-      missionId: mission.id,
-      sourceNodeKey: 'A',
-      specification: { ...seed.tasks[0].task.specification, title: 'A', instruction: 'Implement A.' },
-      dependencies: [],
-      createdAt: now,
-    }
-    const taskB = {
-      ...seed.tasks[0].task,
-      id: 'task_dependency_guard_b',
-      missionId: mission.id,
-      sourceNodeKey: 'B',
-      specification: { ...seed.tasks[0].task.specification, title: 'B', instruction: 'Implement B on A.' },
-      dependencies: [taskA.id],
-      createdAt: now + 1,
-    }
-    store.insertMissionAndTask(mission, taskA)
-    store.database.prepare(`INSERT INTO tasks
-      (id,mission_id,source_node_key,specification_json,dependencies_json,created_at)
-      VALUES (?,?,?,?,?,?)`).run(
-      taskB.id, taskB.missionId, taskB.sourceNodeKey,
-      JSON.stringify(taskB.specification), JSON.stringify(taskB.dependencies), taskB.createdAt,
-    )
+      nodes: [
+        { key: 'A', task: 'Implement A.', verificationCommand: 'node verify-a.mjs --root', dependsOn: [] },
+        { key: 'B', task: 'Implement B on A.', verificationCommand: 'node verify-b.mjs "two words"', dependsOn: ['A'] },
+      ],
+    })
+    const taskA = mission.tasks[0]?.task
+    const taskB = mission.tasks[1]?.task
+    if (taskA === undefined || taskB === undefined) throw new Error('two-node Mission did not materialize both Tasks')
+    const now = Date.now()
+    expect(mission.mission.pipeHash).toBe(hashRecord(mission.mission.pipe))
+    expect(mission.mission.pipe.nodes.map(node => ({ key: node.key, dependsOn: node.dependsOn }))).toEqual([
+      { key: 'A', dependsOn: [] },
+      { key: 'B', dependsOn: ['A'] },
+    ])
+    expect(taskA.dependencies).toEqual([])
+    expect(taskB.dependencies).toEqual([taskA.id])
+    expect(taskA.specification.verification[0]).toMatchObject({
+      key: 'verify-1', command: 'node verify-a.mjs --root', argv: ['node', 'verify-a.mjs', '--root'],
+    })
+    expect(taskB.specification.verification[0]).toMatchObject({
+      key: 'verify-1', command: 'node verify-b.mjs "two words"', argv: ['node', 'verify-b.mjs', 'two words'],
+    })
+    expect(taskA.createdAt).toBe(taskB.createdAt)
+    expect(mission.mission.defaultPolicy).toEqual(POLICY)
+    expect(sessions.resolvePolicyCalls).toBe(1)
+    expect(store.tasksForMission(mission.mission.id)).toHaveLength(2)
+    expect(mission.tasks[1]?.readiness).toMatchObject({
+      status: 'blocked', startable: false, blockedBy: ['A'], baseCommit: null, baseFromAttemptId: null,
+    })
+    expect(mission.tasks[1]?.readiness.reason).toContain('blocked on A')
+    expect(mission.derivedState).toBe('ready')
 
     // Initial path: the public entry point refuses a dependency-bearing node.
     await expect(engine.startAttempt(taskB.id)).rejects.toMatchObject<Partial<ForgeyardDomainError>>({ code: 'INVALID_STATE' })
@@ -406,8 +474,8 @@ describe('Milestone 1: one verified Attempt', () => {
       attemptId: 'attempt_dependency_guard_b1',
       ordinal: 1,
       task: structuredClone(taskB.specification),
-      repository: structuredClone(seed.mission.repository),
-      baseCommit: seed.mission.repository.checkoutHead,
+      repository: structuredClone(mission.mission.repository),
+      baseCommit: mission.mission.repository.checkoutHead,
       policy: structuredClone(POLICY),
       verification: structuredClone(taskB.specification.verification),
       createdAt: now,

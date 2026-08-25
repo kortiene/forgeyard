@@ -107,7 +107,8 @@ function trailerText(value: string): string {
   return value.replace(/[\u0000-\u001f\u007f]/gu, ' ').replace(/\s+/gu, ' ').trim().slice(0, 200)
 }
 
-function requiredText(name: string, value: string, max = 20_000): string {
+function requiredText(name: string, value: unknown, max = 20_000): string {
+  if (typeof value !== 'string') throw new ForgeyardDomainError('INVALID_REQUEST', `${name} must be text`)
   const text = value.trim()
   if (text.length === 0) throw new ForgeyardDomainError('INVALID_REQUEST', `${name} is required`)
   if (Buffer.byteLength(text) > max) throw new ForgeyardDomainError('INVALID_REQUEST', `${name} is too large`)
@@ -161,6 +162,73 @@ export interface EngineConfig {
 interface PlannedAttempt {
   attempt: AttemptRecord
   repository: CanonicalRepository
+}
+
+interface ValidatedMissionNode {
+  key: string
+  instruction: string
+  verificationCommand: string
+  verificationArgv: string[]
+  dependsOn: string[]
+}
+
+/**
+ * Validate the bounded serial Pipe before any repository or provider operation.
+ * This slice accepts only one root node or one root plus one direct follow-up;
+ * parallel edges and a generalized DAG are intentionally unrepresentable.
+ */
+function validateMissionNodes(input: unknown): ValidatedMissionNode[] {
+  if (!Array.isArray(input) || input.length < 1 || input.length > 2) {
+    throw new ForgeyardDomainError('INVALID_REQUEST', 'this slice materializes one or two serial nodes')
+  }
+  const nodes = input.map((value, index) => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      throw new ForgeyardDomainError('INVALID_REQUEST', `node ${index + 1} must be an object`)
+    }
+    const candidate = value as Record<string, unknown>
+    const key = requiredText(`node ${index + 1} key`, candidate.key, 200)
+    const instruction = requiredText(`node ${key} task`, candidate.task)
+    const verificationCommand = requiredText(
+      `node ${key} verification command`, candidate.verificationCommand, 10_000,
+    )
+    if (!Array.isArray(candidate.dependsOn)) {
+      throw new ForgeyardDomainError('INVALID_REQUEST', `node ${key} dependsOn must be an array`)
+    }
+    const dependsOn = candidate.dependsOn.map((dependency, dependencyIndex) =>
+      requiredText(`node ${key} dependency ${dependencyIndex + 1}`, dependency, 200))
+    let verificationArgv: string[]
+    try {
+      verificationArgv = parseCommandLine(verificationCommand)
+    } catch (error) {
+      throw new ForgeyardDomainError(
+        'INVALID_REQUEST',
+        `node ${key} verification command is invalid: ${errorText(error)}`,
+      )
+    }
+    return { key, instruction, verificationCommand, verificationArgv, dependsOn }
+  })
+
+  const seen = new Set<string>()
+  for (const node of nodes) {
+    if (seen.has(node.key)) {
+      throw new ForgeyardDomainError('INVALID_REQUEST', `node key ${node.key} is duplicated`)
+    }
+    seen.add(node.key)
+  }
+  if (nodes[0]?.dependsOn.length !== 0) {
+    throw new ForgeyardDomainError('INVALID_REQUEST', 'the first serial node must have dependsOn: []')
+  }
+  if (nodes.length === 2) {
+    const rootKey = nodes[0]?.key as string
+    const followUp = nodes[1] as ValidatedMissionNode
+    if (followUp.dependsOn.length !== 1 || followUp.dependsOn[0] !== rootKey) {
+      throw new ForgeyardDomainError(
+        'INVALID_REQUEST',
+        `the second serial node must have dependsOn: [${JSON.stringify(rootKey)}]`,
+      )
+    }
+  }
+  return nodes
 }
 
 const VERIFIABLE_STATES = new Set(['running', 'awaiting_decision', 'interrupted', 'needs_review'])
@@ -291,18 +359,21 @@ export class ForgeyardEngine {
 
   async createMission(request: MissionCreateRequest): Promise<MissionView> {
     return this.enqueue(async () => {
+      // Validate every request-controlled value and parse every verifier before
+      // touching the repository or resolving provider policy. A malformed second
+      // node must not observe Git or leave partially prepared authority behind.
       const title = requiredText('title', request.title, 1_000)
       const objective = requiredText('objective', request.objective)
-      const instruction = requiredText('task', request.task)
+      const repositoryPath = requiredText('repository path', request.repositoryPath)
       const baseRef = requiredText('base reference', request.baseRef, 1_000)
-      const verificationCommand = requiredText('verification command', request.verificationCommand, 10_000)
-      if (!isAbsolute(request.repositoryPath)) {
+      const nodes = validateMissionNodes(request.nodes)
+      if (!isAbsolute(repositoryPath)) {
         throw new ForgeyardDomainError('INVALID_REQUEST', 'repository path must be absolute')
       }
 
       let repository: CanonicalRepository
       try {
-        repository = await this.git.canonicalize(request.repositoryPath)
+        repository = await this.git.canonicalize(repositoryPath)
         await this.git.assertClean(repository)
       } catch (error) {
         throw new ForgeyardDomainError('GIT_ERROR', errorText(error))
@@ -315,17 +386,25 @@ export class ForgeyardEngine {
         throw new ForgeyardDomainError('DSH_ERROR', errorText(error))
       }
 
-      let argv: string[]
-      try {
-        argv = parseCommandLine(verificationCommand)
-      } catch (error) {
-        throw new ForgeyardDomainError('INVALID_REQUEST', errorText(error))
+      const materialized = nodes.map(node => ({
+        node,
+        taskId: forgeyardId('task'),
+        requirement: {
+          key: 'verify-1',
+          command: node.verificationCommand,
+          argv: node.verificationArgv,
+        },
+      }))
+      const pipe = {
+        nodes: materialized.map(({ node, requirement }) => ({
+          key: node.key,
+          task: node.instruction,
+          verify: [requirement],
+          // New Mission rows always carry the explicit edge. Optionality exists
+          // only so legacy single-node snapshots with an absent field still read.
+          dependsOn: [...node.dependsOn],
+        })),
       }
-      const requirement = { key: 'verify-1', command: verificationCommand, argv }
-      // One dependency-free node. The Pipe shape now carries an explicit edge
-      // list so a multi-node Mission is derivable from the frozen snapshot
-      // itself rather than from array order.
-      const pipe = { nodes: [{ key: 'implement', task: instruction, verify: [requirement], dependsOn: [] }] }
       const now = Date.now()
       const mission: MissionRecord = {
         id: forgeyardId('mission'),
@@ -338,15 +417,25 @@ export class ForgeyardEngine {
         pipeHash: hashRecord(pipe),
         createdAt: now,
       }
-      const task: TaskRecord = {
-        id: forgeyardId('task'),
+      const taskIdByKey = new Map(materialized.map(({ node, taskId }) => [node.key, taskId]))
+      const tasks: TaskRecord[] = materialized.map(({ node, taskId, requirement }) => ({
+        id: taskId,
         missionId: mission.id,
-        sourceNodeKey: 'implement',
-        specification: { title, objective, instruction, verification: [requirement] },
-        dependencies: [],
+        sourceNodeKey: node.key,
+        specification: {
+          title,
+          objective,
+          instruction: node.instruction,
+          verification: [requirement],
+        },
+        dependencies: node.dependsOn.map((key) => {
+          const dependencyId = taskIdByKey.get(key)
+          if (dependencyId === undefined) throw new Error(`validated dependency ${key} has no Task ID`)
+          return dependencyId
+        }),
         createdAt: now,
-      }
-      this.store.insertMissionAndTask(mission, task)
+      }))
+      this.store.insertMissionAndTasks(mission, tasks)
       return this.missionViewUnqueued(mission.id)
     })
   }
@@ -1344,10 +1433,10 @@ export class ForgeyardEngine {
    * Readiness for one node, computed fresh from existing records. It is never
    * stored: a stored copy would drift from the records it summarizes.
    *
-   * Milestone 3 materializes one dependency-free node per Mission, so in normal
-   * operation this resolves to `ready` (startable only until the first Attempt
-   * exists). Dependency-bearing nodes report `blocked`; their admission,
-   * promotion re-validation, and base propagation are the next commit. It fails
+   * A root node resolves to `ready` (startable only until its first Attempt
+   * exists). A materialized serial follow-up reports `blocked`; dependency
+   * satisfaction, promotion re-validation, and base propagation are the next
+   * slice. This projection fails
    * soft on inconsistent dependency records rather than throwing inside the
    * snapshot fan-out, so one bad row cannot blind the whole Cockpit.
    */
@@ -1404,7 +1493,7 @@ export class ForgeyardEngine {
     return {
       status: 'blocked',
       startable: false,
-      reason: 'Dependency resolution is not implemented yet; this node cannot be started.',
+      reason: `This node is blocked on ${blockedBy.join(', ')}. Forgeyard must re-verify approved, promoted upstream output and freeze that commit as this node's base; that admission path is not implemented yet.`,
       blockedBy,
       baseCommit: null,
       baseFromAttemptId: null,
