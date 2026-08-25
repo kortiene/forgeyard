@@ -343,6 +343,119 @@ describe('Milestone 1: one verified Attempt', () => {
     expect(view.derivedState).toBe('ready')
   })
 
+  it('refuses to admit a dependency-bearing node on both the initial and the retry path', async () => {
+    // A dependency-bearing node must never execute until dependency admission and
+    // base propagation exist. The public path already refuses the initial Attempt;
+    // this also pins the Retry path, which resolves the Mission base ref and would
+    // otherwise let a seeded or persisted retryable Attempt produce a successor on
+    // the wrong base. createMission only mints dependency-free single-node Pipes
+    // today, so the two-node Mission and its retryable Attempt are seeded directly.
+    const seed = await engine.createMission(missionRequest())
+    const requirement = seed.tasks[0].task.specification.verification
+    const now = Date.now()
+    const pipe = {
+      nodes: [
+        { key: 'A', task: 'Implement A.', verify: requirement, dependsOn: [] },
+        { key: 'B', task: 'Implement B on A.', verify: requirement, dependsOn: ['A'] },
+      ],
+    }
+    const mission = {
+      ...seed.mission,
+      id: 'mission_dependency_admission_guard',
+      title: 'Dependency admission guard',
+      pipe,
+      pipeHash: hashRecord(pipe),
+      createdAt: now,
+    }
+    const taskA = {
+      ...seed.tasks[0].task,
+      id: 'task_dependency_guard_a',
+      missionId: mission.id,
+      sourceNodeKey: 'A',
+      specification: { ...seed.tasks[0].task.specification, title: 'A', instruction: 'Implement A.' },
+      dependencies: [],
+      createdAt: now,
+    }
+    const taskB = {
+      ...seed.tasks[0].task,
+      id: 'task_dependency_guard_b',
+      missionId: mission.id,
+      sourceNodeKey: 'B',
+      specification: { ...seed.tasks[0].task.specification, title: 'B', instruction: 'Implement B on A.' },
+      dependencies: [taskA.id],
+      createdAt: now + 1,
+    }
+    store.insertMissionAndTask(mission, taskA)
+    store.database.prepare(`INSERT INTO tasks
+      (id,mission_id,source_node_key,specification_json,dependencies_json,created_at)
+      VALUES (?,?,?,?,?,?)`).run(
+      taskB.id, taskB.missionId, taskB.sourceNodeKey,
+      JSON.stringify(taskB.specification), JSON.stringify(taskB.dependencies), taskB.createdAt,
+    )
+
+    // Initial path: the public entry point refuses a dependency-bearing node.
+    await expect(engine.startAttempt(taskB.id)).rejects.toMatchObject<Partial<ForgeyardDomainError>>({ code: 'INVALID_STATE' })
+    await expect(engine.startAttempt(taskB.id)).rejects.toThrow(/dependency admission and base propagation/u)
+
+    // Seed a genuinely retryable Attempt on the dependency-bearing node. The DB
+    // insert-phase guard only admits a 'preparing' row, so the state is walked
+    // forward through the store's own transition seam to 'awaiting_decision'.
+    const snapshot: ExecutionSnapshot = {
+      version: 1,
+      attemptId: 'attempt_dependency_guard_b1',
+      ordinal: 1,
+      task: structuredClone(taskB.specification),
+      repository: structuredClone(seed.mission.repository),
+      baseCommit: seed.mission.repository.checkoutHead,
+      policy: structuredClone(POLICY),
+      verification: structuredClone(taskB.specification.verification),
+      createdAt: now,
+    }
+    store.createAttempt({
+      id: snapshot.attemptId,
+      taskId: taskB.id,
+      ordinal: 1,
+      executionSnapshot: snapshot,
+      executionSnapshotHash: hashRecord(snapshot),
+      baseCommit: snapshot.baseCommit,
+      worktreePath: join(root, 'worktrees', 'seeded-dependency-b1'),
+      worktreeDevice: null,
+      worktreeInode: null,
+      rawWorkspaceBaseline: null,
+      rawWorkspaceBaselineHash: null,
+      retryOfAttemptId: null,
+      successorAttemptId: null,
+      dshSessionId: 'session-seeded-dependency-b1',
+      state: 'preparing',
+      startedAt: null,
+      endedAt: null,
+      gitFingerprint: null,
+      terminalReason: null,
+      createdAt: now,
+      updatedAt: now,
+    })
+    for (const next of ['worktree_ready', 'session_bound', 'running', 'verifying', 'awaiting_decision'] as const) {
+      store.transition(snapshot.attemptId, next)
+    }
+    expect(store.attempt(snapshot.attemptId)?.state).toBe('awaiting_decision')
+
+    // Retry path: the same guard must fire before any base is resolved, so the
+    // successor is never created on the Mission base ref.
+    await expect(engine.retry({
+      attemptId: snapshot.attemptId,
+      actor: 'operator',
+      rationale: 'A dependency-bearing node must not be retried onto the Mission base ref.',
+    })).rejects.toMatchObject<Partial<ForgeyardDomainError>>({ code: 'INVALID_STATE' })
+    await expect(engine.retry({
+      attemptId: snapshot.attemptId,
+      actor: 'operator',
+      rationale: 'A dependency-bearing node must not be retried onto the Mission base ref.',
+    })).rejects.toThrow(/dependency admission and base propagation/u)
+
+    // The refused retry created no successor: the node still has exactly its one seeded Attempt.
+    expect(store.attemptsForTask(taskB.id).map(item => item.id)).toEqual([snapshot.attemptId])
+  })
+
   it('persists only the v1 authority tables, enforces append-only records, and fails recovery closed', async () => {
     const mission = await engine.createMission(missionRequest())
     const running = await engine.startAttempt(mission.tasks[0].task.id)

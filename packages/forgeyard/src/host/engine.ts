@@ -372,13 +372,20 @@ export class ForgeyardEngine {
     const mission = this.store.mission(task.missionId)
     if (mission === undefined) throw new ForgeyardDomainError('NOT_FOUND', `Mission ${task.missionId} was not found`)
 
+    // A dependency-bearing node must not execute on any base until dependency
+    // admission and base propagation exist. This guards BOTH paths: an initial
+    // Attempt and a Retry successor would each resolve `mission.baseRef` below,
+    // which is the wrong base for a node that must freeze an upstream promoted
+    // commit. Gating it only on the initial path would let a seeded or persisted
+    // retryable Attempt slip a successor through on the Mission base ref.
+    if (task.dependencies.length !== 0) {
+      throw new ForgeyardDomainError(
+        'INVALID_STATE',
+        'This Task has dependencies, but dependency admission and base propagation are not implemented yet.',
+      )
+    }
+
     if (retryOf === null) {
-      if (task.dependencies.length !== 0) {
-        throw new ForgeyardDomainError(
-          'INVALID_STATE',
-          'This Task has dependencies, but dependency admission is not implemented yet.',
-        )
-      }
       if (this.store.attemptsForTask(task.id).length !== 0) {
         throw new ForgeyardDomainError('INVALID_STATE', 'An initial Attempt already exists for this Task.')
       }
