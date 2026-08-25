@@ -62,6 +62,20 @@ job is therefore a product defect, not an unavailable host capability. No
 fail-closed test is weakened and no sandbox requirement is disabled to make CI
 green.
 
+**Observed on `ubuntu-24.04` runners:** the runner reports
+`lockdown,capability,landlock,yama,apparmor,ima,evm`, so a Landlock backend is
+usable even though `bubblewrap` is not installed. The first run
+([32860671974](https://github.com/kortiene/forgeyard/actions/runs/32860671974))
+therefore took the **stronger** branch on both Node legs: the verifier ran
+confined, Attempt 2 reached `PASS`, the exact digest was approved, and one
+explicit local promotion produced a durable ref, re-verified from the
+operator-side repository after the Host exited. CI is consequently proving the
+complete Milestone 1 + Milestone 2 path — Mission through Decision through
+promoted output — and not merely the sandbox-unavailable branch. This is an
+observation about the current runner image, not a guarantee: if a future image
+drops Landlock, the gate stays honest by asserting the fail-closed branch
+instead.
+
 ## What CI does not prove
 
 ### `smoke:native` cannot be a credential-free required check
