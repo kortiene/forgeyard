@@ -1153,9 +1153,33 @@ export class GitAuthority {
     }
   }
 
+  /**
+   * The target this promotion name points at, or null when it is an ordinary
+   * ref. Git dereferences symbolic refs recursively by default, so the resolved
+   * object name alone cannot tell a Forgeyard-owned ref from a symref aimed
+   * somewhere else that happens to resolve to the same commit today.
+   */
+  async promotionSymrefTarget(cwd: string, ref: string): Promise<string | null> {
+    this.assertPromotionRef(ref)
+    const result = await this.invoke(cwd, ['symbolic-ref', '--quiet', '--', ref])
+    if (result.spawnError !== null || !result.stdout.complete) {
+      throw new Error('the Forgeyard promotion ref could not be inspected for a symbolic ref')
+    }
+    return result.exitCode === 0 ? cleanLine(result.stdout.text) : null
+  }
+
   /** Read a Forgeyard promotion ref without creating it. */
   async readPromotionRef(cwd: string, ref: string): Promise<string | null> {
     this.assertPromotionRef(ref)
+    // A promotion output is one Forgeyard-owned ref naming one fixed commit.
+    // A symref that resolves to the recorded commit today is a moving target
+    // pointing outside that namespace — the branch it names can advance and
+    // silently change what the promotion claims to have delivered. Forgeyard
+    // never creates one, so finding one is a disagreement, not an output.
+    const symbolic = await this.promotionSymrefTarget(cwd, ref)
+    if (symbolic !== null) {
+      throw new Error(`${ref} is a symbolic ref to ${symbolic}; Forgeyard never creates one and will not read through it`)
+    }
     const result = await this.invoke(cwd, ['rev-parse', '--verify', '--quiet', '--end-of-options', ref])
     if (result.spawnError !== null || !result.stdout.complete || !result.stderr.complete) {
       throw new Error('the Forgeyard promotion ref could not be read completely')
@@ -1197,12 +1221,9 @@ export class GitAuthority {
   async createPromotionRef(cwd: string, ref: string, commit: string): Promise<void> {
     this.assertPromotionRef(ref)
     if (!/^[0-9a-f]{40,64}$/u.test(commit)) throw new Error('invalid promotion commit object name')
-    const symbolic = await this.invoke(cwd, ['symbolic-ref', '--quiet', '--', ref])
-    if (symbolic.spawnError !== null || !symbolic.stdout.complete) {
-      throw new Error('the Forgeyard promotion ref could not be inspected for a symbolic ref')
-    }
-    if (symbolic.exitCode === 0) {
-      throw new Error(`${ref} is a symbolic ref to ${cleanLine(symbolic.stdout.text)}; Forgeyard will not write through it`)
+    const symbolic = await this.promotionSymrefTarget(cwd, ref)
+    if (symbolic !== null) {
+      throw new Error(`${ref} is a symbolic ref to ${symbolic}; Forgeyard will not write through it`)
     }
     const result = await this.invoke(cwd, ['update-ref', '--no-deref', '--create-reflog', '--end-of-options', ref, commit, ''])
     if (result.spawnError !== null || result.exitCode !== 0) {

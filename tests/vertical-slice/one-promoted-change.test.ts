@@ -970,6 +970,32 @@ describe('Milestone 2: one promoted change', () => {
     expect(await engine.git.readPromotionRef(repositoryPath, record.outputRef)).toBe(record.outputCommit)
   })
 
+  it('never accepts a symbolic output ref that resolves to the promoted commit', async () => {
+    const approved = await approvedAttempt()
+    const promoted = await promote(approved)
+    const record = promoted.promotions[0] as PromotionRecord
+    expect(promoted.promotion).toMatchObject({ status: 'promoted' })
+
+    // A repository writer replaces the output with a symref to a branch that is
+    // at the promoted commit right now. `rev-parse` follows it and returns the
+    // recorded OID, so the resolved value alone cannot tell them apart — but
+    // the output is now a moving target outside Forgeyard's namespace.
+    await run(runtime.runner, repositoryPath, ['git', 'branch', 'moving', record.outputCommit])
+    await run(runtime.runner, repositoryPath, ['git', 'update-ref', '-d', record.outputRef])
+    await run(runtime.runner, repositoryPath, ['git', 'symbolic-ref', record.outputRef, 'refs/heads/moving'])
+    expect(await gitText(repositoryPath, ['git', 'rev-parse', record.outputRef])).toBe(record.outputCommit)
+
+    await expect(engine.git.readPromotionRef(repositoryPath, record.outputRef))
+      .rejects.toThrow(/is a symbolic ref to refs\/heads\/moving/u)
+    const view = await engine.attemptView(approved.attempt.id)
+    expect(view.promotion.reason).toMatch(/could not be confirmed/u)
+    expect(view.promotion.reason).toMatch(/is a symbolic ref/u)
+
+    // And it really was a moving target: the branch advances, the "output" follows.
+    await run(runtime.runner, repositoryPath, ['git', 'branch', '-f', 'moving', approved.attempt.baseCommit])
+    expect(await gitText(repositoryPath, ['git', 'rev-parse', record.outputRef])).toBe(approved.attempt.baseCommit)
+  })
+
   it('never fails a promotion another Host may still be creating', async () => {
     const approved = await approvedAttempt()
     const decision = approved.decisions[0] as DecisionRecord

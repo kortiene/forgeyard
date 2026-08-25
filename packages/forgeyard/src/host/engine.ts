@@ -734,6 +734,22 @@ export class ForgeyardEngine {
     prefix: string,
     cause: unknown,
   ): Promise<AttemptView> {
+    // A symref at the promotion name proves no Forgeyard-owned output exists
+    // there: Forgeyard only ever creates a direct ref, and refuses to write
+    // through a symref. That is a definite failure, not an uncertain one, so
+    // the Attempt is released now instead of waiting out a lease it cannot
+    // learn anything more from.
+    let symbolic: string | null = null
+    try {
+      symbolic = await this.git.promotionSymrefTarget(prepared.repository.path, record.outputRef)
+    } catch {
+      symbolic = null
+    }
+    if (symbolic !== null) {
+      const symrefReason = `${prefix}: ${record.outputRef} is a symbolic ref to ${symbolic}, so no Forgeyard-owned output exists at that name`
+      this.failPromotion(record.id, symrefReason, cause)
+      throw new ForgeyardDomainError('GIT_ERROR', boundedReason(symrefReason, cause))
+    }
     let observed: string | null
     try {
       observed = await this.git.readPromotionRef(prepared.repository.path, record.outputRef)

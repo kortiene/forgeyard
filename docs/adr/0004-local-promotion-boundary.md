@@ -206,6 +206,17 @@ trust boundary, and it cannot produce a write outside `refs/forgeyard/`. A ref i
 the commit object it names is proven to exist and to be a commit, so a pruned or
 damaged object database is reported instead of advertised as a durable output.
 
+The same rejection applies when *reading*. Git dereferences symbolic refs
+recursively by default, so a promotion name replaced by a symref to a branch
+that happens to sit on the recorded commit resolves to exactly the expected
+object name — and then silently follows that branch when it advances. The
+resolved value alone therefore cannot distinguish a Forgeyard-owned output from
+a moving target aimed outside the namespace, and a symref found at a promotion
+name is reported as a disagreement rather than accepted. Because Forgeyard only
+ever creates a direct ref, a symref at that name also proves no Forgeyard output
+exists there, so a promotion that meets one fails immediately instead of waiting
+out a lease that could not teach it anything more.
+
 Migration 003 is the first migration that can meet a database another Host is
 already upgrading. The runner therefore re-reads what has actually been applied
 *inside* its `BEGIN IMMEDIATE` transaction, so a Host whose startup version read

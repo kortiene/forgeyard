@@ -113,6 +113,7 @@ Git itself refuses).
 | two Hosts open a shared database needing migration 003 | the migration runner re-reads what is applied inside its write transaction, so the loser skips it instead of failing startup |
 | two Hosts promote one Attempt at the same moment | each builds its tree in its own exclusively created scratch directory, so the loser loses on the durable constraint rather than on a deleted scratch file |
 | a completed promotion's ref is deleted or moved outside Forgeyard | the panel reports `diverged`, naming the recorded commit and what the ref holds now; Forgeyard never recreates or overwrites it |
+| a completed promotion's ref is replaced by a symref that resolves to the recorded commit | rejected on read, not accepted: the resolved object name matches today but follows the branch tomorrow, so it is reported as unconfirmed |
 | a concurrent promotion of the same Attempt | one succeeds; the other is `PROMOTION_BLOCKED` by the SQLite partial unique index before Git is touched |
 | a repeated promotion of a completed one | `PROMOTION_BLOCKED` with a stable message naming the existing ref and commit |
 | interrupted before the ref existed | once its lease expires the Promotion reconciles to `failed` ("no durable output exists") and the Attempt may be promoted again |
