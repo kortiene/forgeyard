@@ -6,8 +6,8 @@ import { ForgeyardDomainError, ForgeyardEngine } from '../../packages/forgeyard/
 import { TrustedEvidenceCollector } from '../../packages/forgeyard/src/host/evidence.ts'
 import type { PolicyOverrides, SessionGateway } from '../../packages/forgeyard/src/host/execution.ts'
 import { GitAuthority } from '../../packages/forgeyard/src/host/git.ts'
-import { hashRecord, sha256 } from '../../packages/forgeyard/src/host/hash.ts'
-import { ForgeyardStore } from '../../packages/forgeyard/src/host/store.ts'
+import { canonicalJson, hashRecord, sha256 } from '../../packages/forgeyard/src/host/hash.ts'
+import { assertAttemptRecordIntegrity, ForgeyardStore } from '../../packages/forgeyard/src/host/store.ts'
 import { makeCanonicalTempDir, run, seedRepository, testRuntime, type TestRuntime } from '../helpers/runtime.ts'
 
 const POLICY: ResolvedPolicySnapshot = {
@@ -397,9 +397,10 @@ describe('Milestone 1: one verified Attempt', () => {
     await expect(engine.startAttempt(taskB.id)).rejects.toMatchObject<Partial<ForgeyardDomainError>>({ code: 'INVALID_STATE' })
     await expect(engine.startAttempt(taskB.id)).rejects.toThrow(/dependency admission and base propagation/u)
 
-    // Seed a genuinely retryable Attempt on the dependency-bearing node. The DB
-    // insert-phase guard only admits a 'preparing' row, so the state is walked
-    // forward through the store's own transition seam to 'awaiting_decision'.
+    // Seed a structurally valid retryable Attempt on the dependency-bearing
+    // node. The insert-phase guard only admits a 'preparing' row; bind the same
+    // durable worktree identity/raw-baseline authority a real Attempt carries,
+    // then walk the store's own transitions to 'awaiting_decision'.
     const snapshot: ExecutionSnapshot = {
       version: 1,
       attemptId: 'attempt_dependency_guard_b1',
@@ -434,10 +435,28 @@ describe('Milestone 1: one verified Attempt', () => {
       createdAt: now,
       updatedAt: now,
     })
+    const baselineCanonical = canonicalJson({ entries: [], rootPath: '.', version: 1 })
+    const baseline = {
+      version: 1 as const,
+      rootPath: '.' as const,
+      entries: [],
+      canonical: baselineCanonical,
+      hash: sha256(baselineCanonical),
+    }
+    store.bindWorktreeIdentity(snapshot.attemptId, '1', '1', baseline, baseline.hash)
     for (const next of ['worktree_ready', 'session_bound', 'running', 'verifying', 'awaiting_decision'] as const) {
       store.transition(snapshot.attemptId, next)
     }
-    expect(store.attempt(snapshot.attemptId)?.state).toBe('awaiting_decision')
+    const predecessor = store.attempt(snapshot.attemptId)
+    expect(predecessor).toMatchObject({
+      state: 'awaiting_decision',
+      successorAttemptId: null,
+      worktreeDevice: '1',
+      worktreeInode: '1',
+      rawWorkspaceBaselineHash: baseline.hash,
+    })
+    expect(predecessor).toBeDefined()
+    expect(() => assertAttemptRecordIntegrity(predecessor!)).not.toThrow()
 
     // Retry path: the same guard must fire before any base is resolved, so the
     // successor is never created on the Mission base ref.
@@ -452,8 +471,13 @@ describe('Milestone 1: one verified Attempt', () => {
       rationale: 'A dependency-bearing node must not be retried onto the Mission base ref.',
     })).rejects.toThrow(/dependency admission and base propagation/u)
 
-    // The refused retry created no successor: the node still has exactly its one seeded Attempt.
+    // The refused retry is side-effect free: the predecessor is byte-for-byte
+    // unchanged, no RETRY Decision or successor exists, no Session was admitted,
+    // and the Task still owns exactly its one seeded Attempt.
+    expect(store.attempt(snapshot.attemptId)).toEqual(predecessor)
+    expect(store.decisions(snapshot.attemptId)).toEqual([])
     expect(store.attemptsForTask(taskB.id).map(item => item.id)).toEqual([snapshot.attemptId])
+    expect(sessions.admissions).toEqual([])
   })
 
   it('persists only the v1 authority tables, enforces append-only records, and fails recovery closed', async () => {
