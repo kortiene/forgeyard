@@ -1,0 +1,162 @@
+# Forgeyard repository safety gate.
+#
+# WHAT THIS WORKFLOW PROVES
+#   The reproducible, credential-free `pnpm check` gate: the dual-face build,
+#   the full vitest suite, and `smoke:profile`, which boots the real pinned DSH
+#   Web profile and drives two native Attempts through trusted Evidence,
+#   Verification, RETRY, and a terminal Decision.
+#
+# WHAT THIS WORKFLOW DOES NOT PROVE
+#   `smoke:native` and `smoke:browser` are NOT run here. Both hard-require a
+#   real operator DSH provider credential (`.credentials.yaml`) and therefore
+#   cannot be credential-free required checks. They remain operator/manual
+#   acceptance gates. See docs/ci.md. This workflow never configures a provider
+#   credential, never relaxes a sandbox requirement, and never reports a
+#   provider-driven acceptance run that did not happen.
+#
+# Forgeyard is fail-closed by design: `smoke:profile` asserts BOTH branches
+# (sandbox available -> approve + promote; sandbox unavailable -> approval and
+# promotion proven blocked). It is honest on a runner either way, so no test is
+# weakened to make CI green.
+
+name: safety-gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: the gate only reads the tree.
+permissions:
+  contents: read
+
+concurrency:
+  group: safety-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Corepack must never block on an interactive download prompt in CI.
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+  # An unattended runner must not emit DSH telemetry.
+  DSH_TELEMETRY_MODE: DISABLED
+
+jobs:
+  check:
+    name: check (node ${{ matrix.node }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both legs of the supported engines range: "^22.19.0 || >=24.0.0".
+        node: ['22.19.0', '24']
+
+    steps:
+      - name: Check out the exact commit
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # setup-node runs FIRST and deliberately without `cache: pnpm`.
+      # Corepack installs its shims into the bin directory of whichever Node is
+      # active when it runs, so enabling Corepack before setup-node would strand
+      # the pnpm shim in the runner's default Node installation and leave this
+      # job without pnpm. Ordering here is load-bearing, not cosmetic.
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # pnpm is pinned by `packageManager` (pnpm@11.7.0). Corepack activates
+      # exactly that version, so CI cannot silently drift to another pnpm.
+      - name: Activate the pinned pnpm through Corepack
+        run: |
+          corepack enable
+          corepack prepare --activate
+
+      - name: Record the toolchain actually used
+        run: |
+          echo "node:  $(node --version)"
+          echo "pnpm:  $(pnpm --version)"
+          echo "git:   $(git --version)"
+          echo "arch:  $(uname -m)  kernel: $(uname -r)"
+
+      # Cache the pnpm content-addressable store explicitly. setup-node's own
+      # `cache: pnpm` cannot be used here because it requires pnpm to already
+      # exist when setup-node runs, which the ordering above rules out.
+      - name: Resolve the pnpm store path
+        id: pnpm-store
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-${{ runner.os }}-node${{ matrix.node }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-store-${{ runner.os }}-node${{ matrix.node }}-
+
+      # The lockfile is part of Forgeyard's DSH compatibility boundary
+      # (docs/dsh-compatibility.md). --frozen-lockfile fails rather than
+      # resolving a different dependency graph than the one under review.
+      - name: Install with the frozen lockfile
+        run: pnpm install --frozen-lockfile
+
+      # profiles/local is deliberately outside the pnpm workspace and its
+      # node_modules is gitignored, so the root install does NOT create the
+      # `forgeyard` bundle link. Without this step the pinned profile cannot
+      # resolve its own bundle and smoke:profile fails at boot with
+      # 'cannot resolve profile bundle "forgeyard"'. This provisions the
+      # checkout; it is not a change to application behavior.
+      - name: Link the local DSH profile bundle
+        run: pnpm --dir profiles/local install --ignore-workspace --no-lockfile
+
+      # Diagnostic only: report whether this runner has a usable DSH sandbox
+      # backend. smoke:profile asserts the correct behavior in BOTH cases, so
+      # this never gates the result -- it explains which branch it took.
+      - name: Report host sandbox capability (diagnostic)
+        continue-on-error: true
+        run: |
+          echo "LSMs: $(cat /sys/kernel/security/lsm 2>/dev/null || echo unknown)"
+          echo "bubblewrap: $(command -v bwrap || echo 'not installed')"
+          echo "apparmor_restrict_unprivileged_userns: $(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo n/a)"
+
+      # The reproducible gate: build -> test -> smoke:profile.
+      # Invoked as the single `pnpm check` script so CI executes exactly the
+      # documented local gate, not a re-spelled approximation of it.
+      #
+      # No provider credential is configured, on purpose.
+      - name: Run the reproducible gate (pnpm check)
+        run: pnpm check
+
+      # Preserve useful diagnostics from a failed build/test/smoke run.
+      - name: Collect diagnostics
+        if: always()
+        run: |
+          mkdir -p ci-diagnostics
+          {
+            echo "commit: ${{ github.sha }}"
+            echo "node:   $(node --version)"
+            echo "pnpm:   $(pnpm --version)"
+            echo "git:    $(git --version)"
+            echo "kernel: $(uname -r)"
+          } > ci-diagnostics/toolchain.txt
+          # Emitted dual-face build artifacts (present only after a successful build).
+          if [ -d packages/forgeyard/lib ]; then
+            find packages/forgeyard/lib -type f | sort > ci-diagnostics/build-artifacts.txt
+          else
+            echo "no build artifacts: the build did not complete" > ci-diagnostics/build-artifacts.txt
+          fi
+          # Any spilled logs the run left behind outside node_modules.
+          find . -maxdepth 3 -name '*.log' -not -path './node_modules/*' \
+            -exec cp --parents {} ci-diagnostics/ \; 2>/dev/null || true
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: safety-gate-diagnostics-node${{ matrix.node }}
+          path: ci-diagnostics/
+          retention-days: 7
+          if-no-files-found: warn
