@@ -289,6 +289,9 @@ function MissionCreatePanel({
   const [baseRef, setBaseRef] = useState('HEAD')
   const [task, setTask] = useState('')
   const [verificationCommand, setVerificationCommand] = useState('')
+  const [followUpEnabled, setFollowUpEnabled] = useState(false)
+  const [followUpTask, setFollowUpTask] = useState('')
+  const [followUpVerificationCommand, setFollowUpVerificationCommand] = useState('')
 
   const submit = (event: FormEvent<HTMLFormElement>): void => {
     event.preventDefault()
@@ -297,8 +300,20 @@ function MissionCreatePanel({
       objective: objective.trim(),
       repositoryPath: repositoryPath.trim(),
       baseRef: baseRef.trim(),
-      task: task.trim(),
-      verificationCommand: verificationCommand.trim(),
+      nodes: [
+        {
+          key: 'implement',
+          task: task.trim(),
+          verificationCommand: verificationCommand.trim(),
+          dependsOn: [],
+        },
+        ...(followUpEnabled ? [{
+          key: 'follow-up',
+          task: followUpTask.trim(),
+          verificationCommand: followUpVerificationCommand.trim(),
+          dependsOn: ['implement'],
+        }] : []),
+      ],
       provider: null,
       model: null,
       reasoningEffort: null,
@@ -329,9 +344,27 @@ function MissionCreatePanel({
           <Field label="Repository"><input required placeholder="/absolute/path" value={repositoryPath} onChange={event => { setRepositoryPath(event.target.value) }} /></Field>
           <div className="fy-form-row">
             <Field label="Base ref"><input required value={baseRef} onChange={event => { setBaseRef(event.target.value) }} /></Field>
-            <Field label="Verify"><input required placeholder="pnpm test" value={verificationCommand} onChange={event => { setVerificationCommand(event.target.value) }} /></Field>
+            <Field label="Root verify"><input required placeholder="pnpm test" value={verificationCommand} onChange={event => { setVerificationCommand(event.target.value) }} /></Field>
           </div>
-          <Field label="Task instruction"><textarea required rows={5} value={task} onChange={event => { setTask(event.target.value) }} /></Field>
+          <Field label="Root node · implement"><textarea required rows={5} value={task} onChange={event => { setTask(event.target.value) }} /></Field>
+          <button
+            type="button"
+            className="fy-secondary"
+            aria-expanded={followUpEnabled}
+            onClick={() => { setFollowUpEnabled(value => !value) }}
+          >
+            {followUpEnabled ? 'Remove follow-up node' : 'Add serial follow-up node'}
+          </button>
+          {followUpEnabled ? (
+            <>
+              <Field label="Follow-up node · follows implement">
+                <textarea required rows={5} value={followUpTask} onChange={event => { setFollowUpTask(event.target.value) }} />
+              </Field>
+              <Field label="Follow-up verify">
+                <input required placeholder="pnpm test" value={followUpVerificationCommand} onChange={event => { setFollowUpVerificationCommand(event.target.value) }} />
+              </Field>
+            </>
+          ) : null}
           <button type="submit" className="fy-primary" disabled={busy}>Create mission</button>
         </form>
       ) : null}

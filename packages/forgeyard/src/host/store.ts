@@ -349,7 +349,56 @@ export class ForgeyardStore {
     }
   }
 
-  insertMissionAndTask(mission: MissionRecord, task: TaskRecord): void {
+  insertMissionAndTasks(mission: MissionRecord, tasks: TaskRecord[]): void {
+    const pipeNodes = mission.pipe.nodes
+    if (pipeNodes.length < 1 || pipeNodes.length > 2 || tasks.length !== pipeNodes.length) {
+      throw new Error('Mission authority requires exactly one Task per one- or two-node Pipe')
+    }
+    if (hashRecord(mission.pipe) !== mission.pipeHash) throw new Error('Mission Pipe hash is invalid')
+
+    const pipeKeys = new Set<string>()
+    for (const node of pipeNodes) {
+      if (pipeKeys.has(node.key)) throw new Error(`Mission Pipe node key ${node.key} is duplicated`)
+      pipeKeys.add(node.key)
+    }
+    const rootDependencies = pipeNodes[0]?.dependsOn ?? []
+    if (rootDependencies.length !== 0) throw new Error('Mission root Pipe node must not have dependencies')
+    if (pipeNodes.length === 2) {
+      const followUpDependencies = pipeNodes[1]?.dependsOn ?? []
+      if (followUpDependencies.length !== 1 || followUpDependencies[0] !== pipeNodes[0]?.key) {
+        throw new Error('Mission follow-up Pipe node must depend exactly on the root node')
+      }
+    }
+
+    const taskIds = new Set<string>()
+    const taskByNodeKey = new Map<string, TaskRecord>()
+    for (const task of tasks) {
+      if (task.missionId !== mission.id) throw new Error(`Task ${task.id} belongs to a different Mission`)
+      if (taskIds.has(task.id)) throw new Error(`Task ID ${task.id} is duplicated`)
+      if (taskByNodeKey.has(task.sourceNodeKey)) {
+        throw new Error(`Task node key ${task.sourceNodeKey} is duplicated`)
+      }
+      taskIds.add(task.id)
+      taskByNodeKey.set(task.sourceNodeKey, task)
+    }
+    for (const node of pipeNodes) {
+      const task = taskByNodeKey.get(node.key)
+      if (task === undefined) throw new Error(`Mission Pipe node ${node.key} has no materialized Task`)
+      if (task.specification.title !== mission.title || task.specification.objective !== mission.objective
+        || task.specification.instruction !== node.task
+        || canonicalJson(task.specification.verification) !== canonicalJson(node.verify)) {
+        throw new Error(`Task ${task.id} specification does not match Pipe node ${node.key}`)
+      }
+      const expectedDependencies = (node.dependsOn ?? []).map((key) => {
+        const dependency = taskByNodeKey.get(key)
+        if (dependency === undefined) throw new Error(`Pipe dependency ${key} has no materialized Task`)
+        return dependency.id
+      })
+      if (canonicalJson(task.dependencies) !== canonicalJson(expectedDependencies)) {
+        throw new Error(`Task ${task.id} dependencies do not match Pipe node ${node.key}`)
+      }
+    }
+
     this.immediate(() => {
       this.database.prepare(`INSERT INTO missions
         (id,title,objective,repository_json,base_ref,policy_json,pipe_json,pipe_hash,created_at)
@@ -357,12 +406,15 @@ export class ForgeyardStore {
         mission.id, mission.title, mission.objective, canonicalJson(mission.repository), mission.baseRef,
         canonicalJson(mission.defaultPolicy), canonicalJson(mission.pipe), mission.pipeHash, mission.createdAt,
       )
-      this.database.prepare(`INSERT INTO tasks
+      const insertTask = this.database.prepare(`INSERT INTO tasks
         (id,mission_id,source_node_key,specification_json,dependencies_json,created_at)
-        VALUES (?,?,?,?,?,?)`).run(
-        task.id, task.missionId, task.sourceNodeKey, canonicalJson(task.specification),
-        canonicalJson(task.dependencies), task.createdAt,
-      )
+        VALUES (?,?,?,?,?,?)`)
+      for (const task of tasks) {
+        insertTask.run(
+          task.id, task.missionId, task.sourceNodeKey, canonicalJson(task.specification),
+          canonicalJson(task.dependencies), task.createdAt,
+        )
+      }
     })
   }
 

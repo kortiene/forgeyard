@@ -136,8 +136,8 @@ The default bundle configuration writes `forgeyard.sqlite` and `forgeyard-worktr
 
 In the Cockpit:
 
-1. Create a Mission with a repository, base ref, objective, implementation instruction, and one verification command.
-2. Start the materialized Task's Attempt. Forgeyard creates and permanently binds the worktree and native DSH Session.
+1. Create a Mission with a repository, base ref, objective, and either one root Task node or one root plus one explicit serial follow-up. Each node freezes its own instruction and verification command; both share the Mission policy.
+2. Start the root Task's Attempt. A follow-up is visible but remains blocked until upstream promotion and propagated-base admission land in the next Milestone 3 slice. Forgeyard creates and permanently binds the worktree and native DSH Session.
 3. Enter the Session from Attempt review. The overlay closes before `ctx.sessions.open(sessionId)` runs.
 4. Use the Session-header Forgeyard action to return to the exact Attempt, then explicitly request Verification. Forgeyard safely cold-resumes a persisted Session through the public `sessions.models` API when needed, validates the frozen execution policy, and claims the exact Agent's maintenance phase instead of racing execution.
 5. Inspect Git Evidence, command Evidence, Verification, and the review digest. Approve is available only for a current, complete, all-passing review; Reject, Retry, and Cancel remain explicit append-only Decisions.

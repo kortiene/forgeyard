@@ -104,12 +104,16 @@ async function main() {
       objective: 'Prove a real model-authored code change under trusted verification.',
       repositoryPath: repository,
       baseRef: 'main',
-      task: [
-        'Edit the file named answer.txt in the current workspace so that its entire contents are',
-        'exactly the two characters 4 and 2 followed by a single trailing newline, and nothing else.',
-        'Do not modify any other file. Use your editing tools to make the change now.',
-      ].join(' '),
-      verificationCommand: 'node verify.mjs',
+      nodes: [{
+        key: 'implement',
+        task: [
+          'Edit the file named answer.txt in the current workspace so that its entire contents are',
+          'exactly the two characters 4 and 2 followed by a single trailing newline, and nothing else.',
+          'Do not modify any other file. Use your editing tools to make the change now.',
+        ].join(' '),
+        verificationCommand: 'node verify.mjs',
+        dependsOn: [],
+      }],
       provider,
       model,
       reasoningEffort,

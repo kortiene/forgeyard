@@ -517,13 +517,24 @@ export interface StartAttemptRequest {
   taskId: TaskId
 }
 
+export interface MissionNodeRequest {
+  /** Operator-chosen key frozen into the Pipe snapshot after validation/trim. */
+  key: string
+  /** Instruction for this node's Task. */
+  task: string
+  /** One direct-argv verifier command for this bounded slice. */
+  verificationCommand: string
+  /** Explicit dependency node keys: [] for root, [rootKey] for the follow-up. */
+  dependsOn: string[]
+}
+
 export interface MissionCreateRequest {
   title: string
   objective: string
   repositoryPath: string
   baseRef: string
-  task: string
-  verificationCommand: string
+  /** Exactly one root node or two nodes forming one serial root -> follow-up edge. */
+  nodes: MissionNodeRequest[]
   provider: string | null
   model: string | null
   reasoningEffort: string | null
