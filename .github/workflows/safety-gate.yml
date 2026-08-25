@@ -1,8 +1,9 @@
 # Forgeyard repository safety gate.
 #
 # WHAT THIS WORKFLOW PROVES
-#   The reproducible, credential-free `pnpm check` gate: the dual-face build,
-#   the full vitest suite, and `smoke:profile`, which boots the real pinned DSH
+#   The reproducible, credential-free `pnpm check` gate: every repository MJS
+#   harness parses, the dual-face package builds, the full vitest suite passes,
+#   and `smoke:profile` boots the real pinned DSH
 #   Web profile and drives two native Attempts through trusted Evidence,
 #   Verification, RETRY, and a terminal Decision.
 #
@@ -122,7 +123,7 @@ jobs:
           echo "bubblewrap: $(command -v bwrap || echo 'not installed')"
           echo "apparmor_restrict_unprivileged_userns: $(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo n/a)"
 
-      # The reproducible gate: build -> test -> smoke:profile.
+      # The reproducible gate: recursive MJS syntax -> build -> test -> smoke:profile.
       # Invoked as the single `pnpm check` script so CI executes exactly the
       # documented local gate, not a re-spelled approximation of it.
       #

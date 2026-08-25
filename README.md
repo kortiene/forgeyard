@@ -158,12 +158,14 @@ pnpm check
 Or run the compatibility and product boundaries independently:
 
 ```sh
+pnpm check:scripts
 pnpm test:dsh-contract
 pnpm test:real-git
 pnpm test:vertical-slice
 pnpm smoke:profile
 ```
 
+- `check:scripts` recursively parse-checks every regular `scripts/**/*.mjs` file with the active Node binary, including operator harnesses CI cannot execute without credentials.
 - DSH contract tests guard the pinned package versions, public Host calls, cold Session resume, frozen model/permission/tool enforcement, complete Agent/subagent/Job maintenance fences, sandbox policy/confinement, static dual-face package shape, emitted browser bundle rendering, slot lifetimes, Session round trip, managed subprocess seam, and generated Typert surface.
 - Real Git tests use temporary repositories and worktrees; they do not mock Git.
 - The vertical slice exercises Mission through Decision and Retry, including `FAIL` and `INCOMPLETE` verifiers that must block approval, verifier-created ignored state, original-checkout drift, recovery, and absent-Session cancellation. It also drives approve → promote end to end, including exact tree correspondence, every non-approvable outcome, ref collision, concurrent and repeated promotion, and restart reconciliation.
