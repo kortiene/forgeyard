@@ -68,6 +68,11 @@ export interface PipeNodeSnapshot {
   key: string
   task: string
   verify: VerificationRequirement[]
+  /**
+   * Node keys this node depends on. Absent in Missions frozen before the Pipe
+   * existed, which is read as `[]` — exactly the single-node truth.
+   */
+  dependsOn?: string[]
 }
 
 export interface PipeSnapshot {
@@ -437,11 +442,69 @@ export interface AttemptView {
   promotion: PromotionEligibility
 }
 
+export type TaskReadinessStatus =
+  /** Every declared dependency is satisfied. Admission is reported separately by `startable`. */
+  | 'ready'
+  /** At least one dependency is unsatisfied, unsettled, or diverged. */
+  | 'blocked'
+  /**
+   * An upstream Task is rejected. Rejection is terminal — `RETRYABLE_STATES`
+   * excludes it and migration 002 enforces the same set — so no Attempt of this
+   * node can ever become startable. The remedy is a new Mission.
+   */
+  | 'dead'
+
+export interface TaskReadiness {
+  status: TaskReadinessStatus
+  /**
+   * True exactly when dependencies are ready and this Task has no initial
+   * Attempt yet. `startAttempt` refuses when false.
+   */
+  startable: boolean
+  /** Operator-facing explanation. Always set for `blocked` and `dead`. */
+  reason: string | null
+  /** Node keys of unmet dependencies, for the Cockpit's edge rendering. */
+  blockedBy: string[]
+  /**
+   * The upstream promoted commit this node freezes as its base, resolved only
+   * when `status === 'ready'`. Null for a root node, which uses the Mission
+   * base ref.
+   */
+  baseCommit: string | null
+  /** The upstream Attempt whose Promotion produced `baseCommit`. */
+  baseFromAttemptId: AttemptId | null
+}
+
+export interface TaskNodeView {
+  task: TaskRecord
+  /** Every Attempt of this Task, oldest first — the per-node history. */
+  attempts: AttemptView[]
+  readiness: TaskReadiness
+  /** This node's own state: the latest Attempt state, or 'ready' when none. */
+  nodeState: AttemptState | 'ready'
+}
+
+/**
+ * Mission-level rollup over every node. Evaluated with a total, ordered,
+ * first-match-wins rule so the public value is deterministic for mixed states:
+ * attention-demanding states outrank quiescent ones, and a Mission never
+ * reports `complete` or `ready` while any node still needs an operator.
+ */
+export type MissionRollupState =
+  | 'running'
+  | 'awaiting_decision'
+  | 'needs_review'
+  | 'dead'
+  | 'stopped'
+  | 'complete'
+  | 'ready'
+  | 'blocked'
+
 export interface MissionView {
   mission: MissionRecord
-  task: TaskRecord
-  attempts: AttemptView[]
-  derivedState: string
+  /** Exactly one view per materialized node, in frozen `PipeSnapshot.nodes` order. */
+  tasks: TaskNodeView[]
+  derivedState: MissionRollupState
 }
 
 export interface ForgeyardSnapshot {

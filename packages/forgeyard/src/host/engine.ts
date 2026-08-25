@@ -14,6 +14,7 @@ import type {
   MissionCreateRequest,
   MissionId,
   MissionRecord,
+  MissionRollupState,
   MissionView,
   PromoteRequest,
   PromotionEligibility,
@@ -22,6 +23,8 @@ import type {
   ReviewState,
   RetryRequest,
   TaskId,
+  TaskNodeView,
+  TaskReadiness,
   TaskRecord,
   VerificationRecord,
 } from '../types.ts'
@@ -163,6 +166,30 @@ interface PlannedAttempt {
 const VERIFIABLE_STATES = new Set(['running', 'awaiting_decision', 'interrupted', 'needs_review'])
 const RETRYABLE_STATES = new Set(['awaiting_decision', 'interrupted', 'needs_review'])
 
+const ACTIVE_STATES = new Set(['preparing', 'worktree_ready', 'session_bound', 'running', 'verifying'])
+
+/**
+ * The Mission rollup over every node, as a total first-match-wins rule.
+ *
+ * Attention-demanding states outrank quiescent ones, so a Mission never reports
+ * `complete` or `ready` while any node still needs an operator. For a
+ * single-node Mission this preserves the operational progression while
+ * intentionally normalizing terminal labels (approved -> complete and
+ * rejected/cancelled -> stopped).
+ */
+export function missionRollupState(nodes: TaskNodeView[]): MissionRollupState {
+  const states = nodes.map(node => node.nodeState)
+  if (states.some(state => ACTIVE_STATES.has(state))) return 'running'
+  if (states.includes('awaiting_decision')) return 'awaiting_decision'
+  if (states.some(state => state === 'needs_review' || state === 'interrupted')) return 'needs_review'
+  if (nodes.some(node => node.readiness.status === 'dead')) return 'dead'
+  if (states.some(state => state === 'rejected' || state === 'cancelled')) return 'stopped'
+  if (states.length > 0 && states.every(state => state === 'approved')
+    && nodes.every(node => node.readiness.status === 'ready')) return 'complete'
+  if (nodes.some(node => node.readiness.startable)) return 'ready'
+  return 'blocked'
+}
+
 /** Modular-monolith application service for the complete Milestone 1 loop. */
 export class ForgeyardEngine {
   /**
@@ -295,7 +322,10 @@ export class ForgeyardEngine {
         throw new ForgeyardDomainError('INVALID_REQUEST', errorText(error))
       }
       const requirement = { key: 'verify-1', command: verificationCommand, argv }
-      const pipe = { nodes: [{ key: 'implement', task: instruction, verify: [requirement] }] }
+      // One dependency-free node. The Pipe shape now carries an explicit edge
+      // list so a multi-node Mission is derivable from the frozen snapshot
+      // itself rather than from array order.
+      const pipe = { nodes: [{ key: 'implement', task: instruction, verify: [requirement], dependsOn: [] }] }
       const now = Date.now()
       const mission: MissionRecord = {
         id: forgeyardId('mission'),
@@ -343,6 +373,12 @@ export class ForgeyardEngine {
     if (mission === undefined) throw new ForgeyardDomainError('NOT_FOUND', `Mission ${task.missionId} was not found`)
 
     if (retryOf === null) {
+      if (task.dependencies.length !== 0) {
+        throw new ForgeyardDomainError(
+          'INVALID_STATE',
+          'This Task has dependencies, but dependency admission is not implemented yet.',
+        )
+      }
       if (this.store.attemptsForTask(task.id).length !== 0) {
         throw new ForgeyardDomainError('INVALID_STATE', 'An initial Attempt already exists for this Task.')
       }
@@ -1269,11 +1305,103 @@ export class ForgeyardEngine {
   private async missionViewUnqueued(missionId: MissionId): Promise<MissionView> {
     const mission = this.store.mission(missionId)
     if (mission === undefined) throw new ForgeyardDomainError('NOT_FOUND', `Mission ${missionId} was not found`)
-    const task = this.store.taskForMission(mission.id)
-    if (task === undefined) throw new Error('Mission has no materialized Task')
-    const attempts: AttemptView[] = []
-    for (const attempt of this.store.attemptsForTask(task.id)) attempts.push(await this.attemptViewUnqueued(attempt.id))
-    return { mission, task, attempts, derivedState: attempts.at(-1)?.attempt.state ?? 'ready' }
+    const materialized = this.store.tasksForMission(mission.id)
+    if (materialized.length === 0) throw new Error('Mission has no materialized Task')
+    // The frozen Pipe — not SQLite insertion time or random Task IDs — owns node
+    // order, so materializing multiple nodes in one transaction can never let
+    // UUID order decide which node the Cockpit renders first. This is a total,
+    // deterministic order that never throws inside the snapshot fan-out: a Task
+    // whose node key is absent from the Pipe (which the creation path does not
+    // produce) sorts last rather than blinding every Mission's view.
+    const nodeOrder = new Map(mission.pipe.nodes.map((node, index) => [node.key, index]))
+    const tasks = [...materialized].sort((left, right) =>
+      (nodeOrder.get(left.sourceNodeKey) ?? Number.MAX_SAFE_INTEGER)
+        - (nodeOrder.get(right.sourceNodeKey) ?? Number.MAX_SAFE_INTEGER)
+      || left.createdAt - right.createdAt
+      || left.id.localeCompare(right.id))
+    const nodes: TaskNodeView[] = []
+    for (const task of tasks) {
+      const attempts: AttemptView[] = []
+      for (const attempt of this.store.attemptsForTask(task.id)) attempts.push(await this.attemptViewUnqueued(attempt.id))
+      nodes.push({
+        task,
+        attempts,
+        readiness: this.taskReadiness(task, tasks, attempts),
+        nodeState: attempts.at(-1)?.attempt.state ?? 'ready',
+      })
+    }
+    return { mission, tasks: nodes, derivedState: missionRollupState(nodes) }
+  }
+
+  /**
+   * Readiness for one node, computed fresh from existing records. It is never
+   * stored: a stored copy would drift from the records it summarizes.
+   *
+   * Milestone 3 materializes one dependency-free node per Mission, so in normal
+   * operation this resolves to `ready` (startable only until the first Attempt
+   * exists). Dependency-bearing nodes report `blocked`; their admission,
+   * promotion re-validation, and base propagation are the next commit. It fails
+   * soft on inconsistent dependency records rather than throwing inside the
+   * snapshot fan-out, so one bad row cannot blind the whole Cockpit.
+   */
+  private taskReadiness(task: TaskRecord, missionTasks: TaskRecord[], attempts: AttemptView[]): TaskReadiness {
+    // Resolve each dependency TaskId to its node key. A dependency that does not
+    // resolve is corruption — the creation path never writes one — but the view
+    // must fail soft exactly as `promotionEligibility` does: one inconsistent
+    // `dependencies_json` row must not throw inside the snapshot fan-out and
+    // blind every Mission's Cockpit. Report it as blocked with a reason instead.
+    const blockedBy: string[] = []
+    const unresolved: string[] = []
+    for (const dependencyId of task.dependencies) {
+      const dependency = missionTasks.find(candidate => candidate.id === dependencyId)
+      if (dependency === undefined) unresolved.push(dependencyId)
+      else blockedBy.push(dependency.sourceNodeKey)
+    }
+    if (unresolved.length > 0) {
+      return {
+        status: 'blocked',
+        startable: false,
+        reason: `This node's recorded dependencies do not resolve within its Mission: ${unresolved.join(', ')}. `
+          + 'The dependency records are inconsistent and must be inspected.',
+        blockedBy,
+        baseCommit: null,
+        baseFromAttemptId: null,
+      }
+    }
+    if (blockedBy.length === 0) {
+      const latest = attempts.at(-1)?.attempt
+      const startable = latest === undefined
+      let reason: string | null = null
+      if (latest !== undefined) {
+        if (RETRYABLE_STATES.has(latest.state)) {
+          reason = 'The first Attempt already exists; use Retry to create an immutable successor.'
+        } else if (latest.state === 'rejected') {
+          reason = 'This Task was rejected and is terminal; create a new Mission for another line of work.'
+        } else if (latest.state === 'cancelled') {
+          reason = 'This Task was cancelled and is terminal; create a new Mission for another line of work.'
+        } else if (latest.state === 'approved') {
+          reason = 'This Task is approved; starting another initial Attempt is not allowed.'
+        } else {
+          reason = `Attempt ${latest.id} already exists in state ${latest.state}; a second initial Attempt is not allowed.`
+        }
+      }
+      return {
+        status: 'ready',
+        startable,
+        reason,
+        blockedBy: [],
+        baseCommit: null,
+        baseFromAttemptId: null,
+      }
+    }
+    return {
+      status: 'blocked',
+      startable: false,
+      reason: 'Dependency resolution is not implemented yet; this node cannot be started.',
+      blockedBy,
+      baseCommit: null,
+      baseFromAttemptId: null,
+    }
   }
 
   async attemptView(attemptId: AttemptId): Promise<AttemptView> {

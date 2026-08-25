@@ -6,7 +6,7 @@ badge imply an assurance nobody actually obtained.
 | Gate | Runs in CI | Requires a provider credential | Requires an operator host capability |
 | --- | --- | --- | --- |
 | `pnpm build` | yes | no | no |
-| `pnpm test` (126 tests) | yes | no | no |
+| `pnpm test` (full Vitest suite) | yes | no | no |
 | `pnpm smoke:profile` | yes | no | no |
 | `pnpm smoke:browser` | **no** | **yes** | a Chromium-family browser |
 | `pnpm smoke:native` | **no** | **yes** | a fully enforcing DSH sandbox backend |

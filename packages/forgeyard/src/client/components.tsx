@@ -17,8 +17,10 @@ import type {
   MissionCreateRequest,
   MissionView,
   PromotionRecord,
+  TaskNodeView,
   VerificationStatus,
 } from '../types.ts'
+import { missionAttempts } from './controller.ts'
 import type { CockpitSnapshot, ForgeyardCockpitController } from './controller.ts'
 import { FORGEYARD_CSS } from './styles.ts'
 
@@ -215,7 +217,9 @@ function CockpitBody({
     }
     case 'attempt': {
       const mission = data.missions.find(item => item.mission.id === view.missionId)
-      const attempt = mission?.attempts.find(item => item.attempt.id === view.attemptId)
+      const attempt = mission === undefined
+        ? undefined
+        : missionAttempts(mission).find(item => item.attempt.id === view.attemptId)
       return mission === undefined || attempt === undefined
         ? <EmptyState title="Attempt unavailable" detail="Refresh to reconcile the ledger." />
         : <AttemptReview cockpit={cockpit} mission={mission} attempt={attempt} busy={snapshot.busy !== null} />
@@ -254,7 +258,7 @@ function MissionsView({
               >
                 <span className="fy-card-topline">
                   <StatusPill state={mission.derivedState} />
-                  <span>{mission.attempts.length} attempt{mission.attempts.length === 1 ? '' : 's'}</span>
+                  <span>{missionAttempts(mission).length} attempt{missionAttempts(mission).length === 1 ? '' : 's'}</span>
                 </span>
                 <strong>{mission.mission.title}</strong>
                 <span className="fy-card-objective">{mission.mission.objective}</span>
@@ -344,7 +348,7 @@ function MissionDetail({
   readonly mission: MissionView
   readonly busy: boolean
 }): ReactNode {
-  const attempts = [...mission.attempts].sort((left, right) => right.attempt.ordinal - left.attempt.ordinal)
+  const attemptCount = missionAttempts(mission).length
   return (
     <div className="fy-view">
       <Breadcrumb onClick={() => { cockpit.showMissions() }}>Missions</Breadcrumb>
@@ -356,60 +360,110 @@ function MissionDetail({
         </div>
         <div className="fy-hero-actions">
           <StatusPill state={mission.derivedState} />
-          <button
-            type="button"
-            className="fy-primary"
-            disabled={busy || attempts.length !== 0}
-            onClick={() => { void cockpit.startAttempt(mission.task.id) }}
-          >
-            {attempts.length === 0 ? 'Start attempt' : 'Attempt started'}
-          </button>
         </div>
       </section>
       <section className="fy-facts" aria-label="Mission facts">
         <Fact label="Repository" value={mission.mission.repository.path} mono />
         <Fact label="Base ref" value={mission.mission.baseRef} mono />
-        <Fact label="Task" value={mission.task.specification.title} />
-        <Fact label="Verification" value={`${mission.task.specification.verification.length} required`} />
+        <Fact label="Nodes" value={`${mission.tasks.length}`} />
+        <Fact label="Attempts" value={`${attemptCount}`} />
         <Fact label="Model" value={`${mission.mission.defaultPolicy.provider} / ${mission.mission.defaultPolicy.model}`} />
         <Fact label="Sandbox" value={mission.mission.defaultPolicy.sandboxMode} />
       </section>
-      <section className="fy-section">
+      <section className="fy-section" aria-label="Pipe nodes">
         <div className="fy-section-title">
           <div>
-            <p className="fy-eyebrow">Execution history</p>
-            <h2>Attempts</h2>
+            <p className="fy-eyebrow">Frozen Pipe</p>
+            <h2>Task nodes</h2>
           </div>
-          <span className="fy-count">{attempts.length}</span>
+          <span className="fy-count">{mission.tasks.length}</span>
         </div>
-        {attempts.length === 0 ? (
-          <EmptyState title="No attempts" detail="Start the first isolated attempt for this task." />
-        ) : (
-          <div className="fy-table" role="table" aria-label="Mission attempts">
-            {attempts.map(attempt => (
-              <button
-                type="button"
-                className="fy-attempt-row"
-                role="row"
-                key={attempt.attempt.id}
-                onClick={() => { cockpit.showAttempt(mission.mission.id, attempt.attempt.id) }}
-              >
-                <span className="fy-attempt-number">#{attempt.attempt.ordinal}</span>
-                <span>
-                  <strong>{shortId(attempt.attempt.id)}</strong>
-                  <small>{formatTime(attempt.attempt.updatedAt)}</small>
-                </span>
-                <StatusPill state={attempt.attempt.state} />
-                <span className="fy-verification-ratio">
-                  {attempt.review.passingVerificationCount}/{attempt.review.requiredVerificationCount} checks
-                </span>
-                <span aria-hidden="true">→</span>
-              </button>
-            ))}
-          </div>
-        )}
+        <div className="fy-node-list">
+          {mission.tasks.map(node => (
+            <MissionNode
+              key={node.task.id}
+              cockpit={cockpit}
+              missionId={mission.mission.id}
+              node={node}
+              busy={busy}
+            />
+          ))}
+        </div>
       </section>
     </div>
+  )
+}
+
+function MissionNode({
+  cockpit,
+  missionId,
+  node,
+  busy,
+}: {
+  readonly cockpit: ForgeyardCockpitController
+  readonly missionId: MissionView['mission']['id']
+  readonly node: TaskNodeView
+  readonly busy: boolean
+}): ReactNode {
+  const attempts = [...node.attempts].sort((left, right) => right.attempt.ordinal - left.attempt.ordinal)
+  const startDisabled = busy || attempts.length !== 0 || !node.readiness.startable
+  return (
+    <article className="fy-node-card" aria-label={`Task node ${node.task.sourceNodeKey}`}>
+      <header className="fy-node-header">
+        <div>
+          <p className="fy-eyebrow">Node <code>{node.task.sourceNodeKey}</code></p>
+          <h3>{node.task.specification.title}</h3>
+          <p>{node.task.specification.instruction}</p>
+        </div>
+        <div className="fy-node-statuses">
+          <span>Readiness <StatusPill state={node.readiness.status} /></span>
+          <span>Attempt <StatusPill state={node.nodeState} /></span>
+        </div>
+      </header>
+      <div className="fy-node-meta">
+        <span>{node.task.specification.verification.length} required check{node.task.specification.verification.length === 1 ? '' : 's'}</span>
+        <span>{node.task.dependencies.length} dependenc{node.task.dependencies.length === 1 ? 'y' : 'ies'}</span>
+        <span>{attempts.length} attempt{attempts.length === 1 ? '' : 's'}</span>
+      </div>
+      {node.readiness.reason === null ? null : <p className="fy-node-reason">{node.readiness.reason}</p>}
+      <div className="fy-node-actions">
+        <button
+          type="button"
+          className="fy-primary"
+          disabled={startDisabled}
+          onClick={() => { void cockpit.startAttempt(node.task.id) }}
+          title={node.readiness.reason ?? undefined}
+        >
+          {attempts.length === 0 ? 'Start attempt' : 'Attempt started'}
+        </button>
+      </div>
+      {attempts.length === 0 ? (
+        <EmptyState title="No attempts" detail="Start the first isolated attempt for this node." />
+      ) : (
+        <div className="fy-table" role="table" aria-label={`Attempts for ${node.task.sourceNodeKey}`}>
+          {attempts.map(attempt => (
+            <button
+              type="button"
+              className="fy-attempt-row"
+              role="row"
+              key={attempt.attempt.id}
+              onClick={() => { cockpit.showAttempt(missionId, attempt.attempt.id) }}
+            >
+              <span className="fy-attempt-number">#{attempt.attempt.ordinal}</span>
+              <span>
+                <strong>{shortId(attempt.attempt.id)}</strong>
+                <small>{formatTime(attempt.attempt.updatedAt)}</small>
+              </span>
+              <StatusPill state={attempt.attempt.state} />
+              <span className="fy-verification-ratio">
+                {attempt.review.passingVerificationCount}/{attempt.review.requiredVerificationCount} checks
+              </span>
+              <span aria-hidden="true">→</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </article>
   )
 }
 
@@ -867,10 +921,13 @@ function humanize(value: string): string {
 }
 
 function toneForState(state: string): 'good' | 'bad' | 'active' | 'neutral' {
-  if (state === 'approved' || state === 'promoted') return 'good'
+  if (state === 'approved' || state === 'promoted' || state === 'complete' || state === 'ready') return 'good'
   if (state === 'rejected' || state === 'cancelled' || state === 'interrupted'
-    || state === 'failed' || state === 'blocked' || state === 'diverged') return 'bad'
+    || state === 'failed' || state === 'blocked' || state === 'diverged'
+    || state === 'dead' || state === 'stopped') return 'bad'
   if (state === 'running' || state === 'verifying' || state === 'awaiting_decision'
-    || state === 'eligible' || state === 'pending' || state === 'uncertain') return 'active'
+    || state === 'eligible' || state === 'pending' || state === 'uncertain'
+    || state === 'needs_review' || state === 'preparing' || state === 'worktree_ready'
+    || state === 'session_bound') return 'active'
   return 'neutral'
 }

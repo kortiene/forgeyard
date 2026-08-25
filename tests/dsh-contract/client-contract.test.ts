@@ -140,8 +140,8 @@ describe('Forgeyard DSH client contracts', () => {
 
   it('returns each native Session to its exact Attempt and never guesses an ambiguous mapping', async () => {
     const attemptA = attempt('attempt-a', 'session-a', 1)
-    const attemptB = attempt('attempt-b', 'session-b', 2)
-    const exactApi = apiDouble(forgeyardSnapshot([attemptA, attemptB]))
+    const attemptB = attempt('attempt-b', 'session-b', 1)
+    const exactApi = apiDouble(twoNodeSnapshot(attemptA, attemptB))
     const { sessions } = sessionsDouble(['session-a', 'session-b'])
     const controller = new ForgeyardCockpitController(exactApi, sessions)
     await controller.refresh()
@@ -156,10 +156,10 @@ describe('Forgeyard DSH client contracts', () => {
 
     controller.dispose()
 
-    const ambiguousApi = apiDouble(forgeyardSnapshot([
+    const ambiguousApi = apiDouble(twoNodeSnapshot(
       attempt('attempt-a', 'shared-session', 1),
-      attempt('attempt-b', 'shared-session', 2),
-    ]))
+      attempt('attempt-b', 'shared-session', 1),
+    ))
     const ambiguous = new ForgeyardCockpitController(ambiguousApi, sessionsDouble(['shared-session']).sessions)
     await ambiguous.refresh()
     expect(ambiguous.attemptIdForSession('shared-session')).toBeUndefined()
@@ -216,6 +216,11 @@ describe('Forgeyard DSH client contracts', () => {
 
   it('installs authoritative Host state after a promotion the Host refuses', async () => {
     const base = attempt('attempt-a', 'session-a', 1)
+    base.attempt.state = 'approved'
+    base.decisions = [{
+      id: 'decision-1', attemptId: 'attempt-a', type: 'APPROVE', reviewDigest: 'd'.repeat(64),
+      actor: 'operator', rationale: 'Approve the exact reviewed state.', createdAt: 1,
+    }]
     const eligible: AttemptView = {
       ...base,
       promotion: {
@@ -256,7 +261,7 @@ describe('Forgeyard DSH client contracts', () => {
     }
     const controller = new ForgeyardCockpitController(api, sessionsDouble(['session-a']).sessions)
     await controller.refresh()
-    expect(controller.getSnapshot().data?.missions[0]?.attempts[0]?.promotion.eligible).toBe(true)
+    expect(controller.getSnapshot().data?.missions[0]?.tasks[0]?.attempts[0]?.promotion.eligible).toBe(true)
 
     await controller.promote({
       attemptId: 'attempt-a',
@@ -271,7 +276,7 @@ describe('Forgeyard DSH client contracts', () => {
     // The panel renders what the Host actually holds now — including the newly
     // recorded failure — instead of the eligible state it showed before the
     // request, which would invite the operator to click promote again.
-    expect(state.data?.missions[0]?.attempts[0]?.promotion).toMatchObject({
+    expect(state.data?.missions[0]?.tasks[0]?.attempts[0]?.promotion).toMatchObject({
       status: 'blocked',
       eligible: false,
       failureReason: 'The Forgeyard promotion ref was not created: reference already exists',
@@ -328,7 +333,7 @@ function apiDouble(
   readonly attemptForSession: ReturnType<typeof vi.fn<ForgeyardClientApi['attemptForSession']>>
 } {
   const mission = data.missions[0] ?? forgeyardSnapshot([]).missions[0]
-  const firstAttempt = mission?.attempts[0]
+  const firstAttempt = mission?.tasks[0]?.attempts[0]
   const attemptForSession = vi.fn<ForgeyardClientApi['attemptForSession']>(async () => sessionRef)
   return {
     snapshot: vi.fn(async () => data),
@@ -364,7 +369,7 @@ function forgeyardSnapshot(attempts: AttemptView[]): ForgeyardSnapshot {
       approvalPolicy: 'granular',
       toolPolicy: 'native',
     },
-    pipe: { nodes: [] },
+    pipe: { nodes: [{ key: 'task', task: 'Implement Forgeyard.', verify: [], dependsOn: [] }] },
     pipeHash: 'pipe-hash',
     createdAt: 1,
   }
@@ -381,13 +386,81 @@ function forgeyardSnapshot(attempts: AttemptView[]): ForgeyardSnapshot {
     dependencies: [],
     createdAt: 1,
   }
+  const latestState = attempts.at(-1)?.attempt.state
+  const nodeState = latestState ?? 'ready'
+  const startable = latestState === undefined
   const missionView: MissionView = {
     mission,
-    task,
-    attempts,
-    derivedState: attempts[attempts.length - 1]?.attempt.state ?? 'planned',
+    tasks: [{
+      task,
+      attempts,
+      readiness: {
+        status: 'ready',
+        startable,
+        reason: startable
+          ? null
+          : latestState === 'approved'
+            ? 'This Task is approved; starting another initial Attempt is not allowed.'
+            : 'The first Attempt already exists; use Retry to create an immutable successor.',
+        blockedBy: [],
+        baseCommit: null,
+        baseFromAttemptId: null,
+      },
+      nodeState,
+    }],
+    derivedState: fixtureMissionRollup(nodeState, startable),
   }
   return { schemaVersion: 1, dshVersion: '0.1.1-rc.2', missions: [missionView] }
+}
+
+/**
+ * Split two native Sessions across distinct Task nodes. The controller must
+ * traverse the node-owned Attempt histories rather than silently falling back
+ * to the first Task of a Mission.
+ */
+function fixtureMissionRollup(
+  state: MissionView['tasks'][number]['nodeState'],
+  startable: boolean,
+): MissionView['derivedState'] {
+  if (['preparing', 'worktree_ready', 'session_bound', 'running', 'verifying'].includes(state)) return 'running'
+  if (state === 'awaiting_decision') return 'awaiting_decision'
+  if (state === 'needs_review' || state === 'interrupted') return 'needs_review'
+  if (state === 'rejected' || state === 'cancelled') return 'stopped'
+  if (state === 'approved') return 'complete'
+  return startable ? 'ready' : 'blocked'
+}
+
+function twoNodeSnapshot(first: AttemptView, second: AttemptView): ForgeyardSnapshot {
+  const data = forgeyardSnapshot([first])
+  const mission = data.missions[0]
+  const firstNode = mission?.tasks[0]
+  if (mission === undefined || firstNode === undefined) throw new Error('fixture Mission node is unavailable')
+  second.attempt.taskId = 'task-2'
+  mission.mission.pipe.nodes.push({ key: 'follow-up', task: 'Implement the follow-up.', verify: [], dependsOn: [] })
+  mission.tasks.push({
+    task: {
+      ...firstNode.task,
+      id: 'task-2',
+      sourceNodeKey: 'follow-up',
+      specification: {
+        ...firstNode.task.specification,
+        title: 'Follow-up',
+        instruction: 'Implement the follow-up.',
+      },
+      createdAt: 2,
+    },
+    attempts: [second],
+    readiness: {
+      status: 'ready',
+      startable: false,
+      reason: 'The first Attempt already exists; use Retry to create an immutable successor.',
+      blockedBy: [],
+      baseCommit: null,
+      baseFromAttemptId: null,
+    },
+    nodeState: second.attempt.state,
+  })
+  return data
 }
 
 function attempt(id: string, sessionId: string, ordinal: number): AttemptView {

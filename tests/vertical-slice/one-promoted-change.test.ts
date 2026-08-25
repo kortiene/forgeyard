@@ -157,7 +157,7 @@ describe('Milestone 2: one promoted change', () => {
 
   async function approvedAttempt(): Promise<AttemptView> {
     const mission = await engine.createMission(missionRequest())
-    const running = await engine.startAttempt(mission.task.id)
+    const running = await engine.startAttempt(mission.tasks[0].task.id)
     const verified = await engine.verifyAttempt(running.attempt.id)
     expect(verified.verifications[0]?.status).toBe('PASS')
     expect(verified.review.canApprove).toBe(true)
@@ -392,7 +392,7 @@ describe('Milestone 2: one promoted change', () => {
   it('refuses every non-approved Attempt outcome', async () => {
     const mission = await engine.createMission(missionRequest())
     sessions.authored = async (cwd) => { await writeFile(join(cwd, 'result.txt'), 'broken\n') }
-    const failing = await engine.startAttempt(mission.task.id)
+    const failing = await engine.startAttempt(mission.tasks[0].task.id)
     const failed = await engine.verifyAttempt(failing.attempt.id)
     expect(failed.verifications[0]?.status).toBe('FAIL')
     expect(failed.promotion).toMatchObject({ status: 'blocked', eligible: false, reviewDigest: null })
@@ -434,7 +434,7 @@ describe('Milestone 2: one promoted change', () => {
 
   it('refuses a cancelled Attempt and a recovery-uncertain Attempt', async () => {
     const mission = await engine.createMission(missionRequest())
-    const running = await engine.startAttempt(mission.task.id)
+    const running = await engine.startAttempt(mission.tasks[0].task.id)
     const cancelled = await engine.decide({
       attemptId: running.attempt.id,
       type: 'CANCEL',
@@ -445,7 +445,7 @@ describe('Milestone 2: one promoted change', () => {
 
     // A Host restart during an external operation makes the Attempt uncertain.
     const second = await engine.createMission({ ...missionRequest(), title: 'Second mission' })
-    const uncertain = await engine.startAttempt(second.task.id)
+    const uncertain = await engine.startAttempt(second.tasks[0].task.id)
     store.close()
     store = new ForgeyardStore(databasePath)
     engine = buildEngine(store)
