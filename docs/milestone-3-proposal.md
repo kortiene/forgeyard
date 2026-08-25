@@ -3,8 +3,11 @@
 - Status: **Proposed, not implemented.** This document exists to resolve design
   questions *before* code, per the Milestone 3 mandate.
 - DSH release: `0.1.1-rc.2` (`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`) — unchanged.
-- Revision 2. Five P1 findings from automated review were verified against the
+- Revision 3. Five P1 findings from automated review were verified against the
   implementation and **all five were correct**; see [Corrections](#corrections-in-revision-2).
+- **The open question is now closed by operator decision** (see Q1): only nodes
+  with a downstream dependent must promote, and the unpromoted-output expiry
+  risk is surfaced as a Cockpit warning rather than enforced.
 
 ## Why this milestone, and why it is small
 
@@ -42,6 +45,45 @@ and Task B is terminal (need not).
 exists *only* on a `PromotionRecord` (`types.ts:362`). If B is not promoted, B
 has no `outputCommit` and no Promotion record, so no acceptance criterion may
 refer to either for B. Criteria 6 and 8 are corrected accordingly.
+
+#### Required vs. possible
+
+This rule governs what Forgeyard **requires**, not what it permits. Promotion is
+already *possible* for every approved Attempt: `promotionEligibility`
+(`engine.ts:1129-1242`) is purely per-Attempt — it reads that Attempt's
+promotions, its `APPROVE` Decision, and the live review digest, and has **no**
+notion of a graph. The profile smoke already promotes a single-node (therefore
+terminal) Mission end to end. An operator may promote a terminal node whenever
+they want a durable artifact; Milestone 3 simply does not force it.
+
+Mandating promotion for every node was considered and **rejected**, for three
+reasons:
+
+1. **It contradicts ADR-0004.** "`APPROVE` authorizes; `promote` delivers."
+   Promotion demands an actor, a rationale, and digest confirmation. Making it
+   mandatory means either auto-promoting — stripping operator intent from a
+   deliberately fail-closed action — or holding the Mission "incomplete" until a
+   human clicks, which is a nag, not a guarantee.
+2. **It would push graph-awareness into a graph-free boundary.** Promotion
+   eligibility knows nothing about dependencies today, and a uniform rule would
+   inject Pipe topology into it to gain nothing an operator cannot already do.
+3. **It mints refs nobody consumes**, permanently, under
+   `refs/forgeyard/promotions/`.
+
+#### The expiry risk this rule accepts, and how it is surfaced
+
+Deferring promotion is not free, and this is the strongest argument against the
+rule. Eligibility fails when
+`review.reviewDigest !== decision.reviewDigest` (`engine.ts:1238`), so an
+approved terminal node whose worktree later drifts becomes **permanently
+unpromotable** — "approve now, promote later" is not a safe assumption. Combined
+with rejection finality (Q3), a deliverable can be quietly lost.
+
+Milestone 3 answers this with **honesty, not enforcement**: the Cockpit must
+warn when an approved Attempt has no Promotion and its reviewed state is at risk
+of going stale, so the operator can choose to promote before drift makes the
+choice for them. Forgeyard does not auto-promote to avoid the warning, and does
+not add machinery to re-derive a promotable state after drift. See criterion 11.
 
 ### 2. Is the existing Promotion ref the authoritative intermediate output?
 
@@ -182,6 +224,11 @@ A Milestone 3 acceptance run must demonstrate, on a real pinned profile:
    accurate remedy, and Forgeyard never offers a `RETRY` the engine refuses.
 10. The operator's branch, index, HEAD, and checkout are unchanged throughout,
     and no push, PR, merge, or CI is triggered.
+11. Terminal Task B is **approved but not promoted**, and the Cockpit shows an
+    explicit warning that its approved output is undelivered and will become
+    permanently unpromotable if its reviewed state drifts. Promoting B must
+    remain **available** to the operator and must succeed when chosen, proving
+    the rule governs what Forgeyard requires, not what it permits.
 
 ## Corrections in revision 2
 
@@ -200,8 +247,9 @@ five were correct. Recorded because they materially changed the design:
 
 Serial only. **No** parallel scheduling, no worker or fleet abstraction, no
 remote transport, no GitHub delivery, no generalized orchestration DAG engine,
-no retry-cascade policy, no remediation enforcement, and no change to
-Milestone 1 rejection semantics.
+no retry-cascade policy, no remediation enforcement, no mandatory promotion for
+terminal nodes, no auto-promotion, no machinery to re-derive a promotable state
+after review drift, and no change to Milestone 1 rejection semantics.
 
 ## Risk
 
