@@ -8,6 +8,8 @@
 - **The open question is now closed by operator decision** (see Q1): only nodes
   with a downstream dependent must promote, and the unpromoted-output expiry
   risk is surfaced as a Cockpit warning rather than enforced.
+- Revision 4 adds Q6: the public `MissionView` reshape, decided in issue #5, and
+  the commit ordering it forces.
 
 ## Why this milestone, and why it is small
 
@@ -193,6 +195,52 @@ lives inside `missions.pipe_json`, so it needs **no SQL migration**, but it does
 change `pipeHash` for new Missions. Existing Missions are unaffected: their
 stored JSON is read as-is, and absent `dependsOn` reads as `[]`, which is
 exactly the single-node truth today.
+
+### 6. What breaks in the public API, and in what order (added in revision 4)
+
+"No SQL migration" is true, but it was being read as "small change". It is not:
+the **public Typert Remote surface must change**, and that is the largest single
+piece of Milestone 3. Recorded in issue #5 and decided there.
+
+`MissionView` carries a **singular** Task (`types.ts:440-445`), and
+`missionViewUnqueued` (`engine.ts:1269-1277`) reads exactly one through
+`store.taskForMission` — literally `ORDER BY created_at,id LIMIT 1`
+(`store.ts:384`) — then throws `'Mission has no materialized Task'` otherwise,
+flattening `attempts` to that one Task. A two-node Mission cannot be represented
+in that shape.
+
+**Decision: `MissionView.task` is removed outright, with no deprecated alias.**
+`forgeyard` is unpublished (`npm view forgeyard` → 404), single-machine and
+single-user, so no external caller needs protecting. An alias would also be
+*actively wrong*: on a Pipe, `mission.task` would silently mean "whichever node
+sorts first", and `components.tsx:363` calls `startAttempt(mission.task.id)` —
+an arbitrary node, started under a compatibility label.
+
+**Decision: `derivedState` becomes per-node state plus a Mission-level rollup.**
+It is currently `attempts.at(-1)?.attempt.state ?? 'ready'` (`engine.ts:1276`),
+which collapses every Attempt in the Mission to the last one and is equally
+single-Task-shaped. Shipping a plural `tasks` beside it would merely relocate
+the lie. Each node reports its own Attempt state and readiness; the Mission
+reports an honest summary derived from **all** nodes. Criterion 7 needs both.
+
+| Layer | Change |
+| --- | --- |
+| SQL schema | **none** |
+| `missions.pipe_json` | `dependsOn: string[]` (JSON-only) |
+| `MissionView` | `task` → `tasks: TaskNodeView[]`; `derivedState` → per-node + rollup |
+| `store` | add `tasksForMission` (plural) |
+| Client | mission detail becomes a node list; `startAttempt` targets an explicit node |
+| Harnesses + tests | ~20 call sites |
+
+Because `smoke:profile` runs inside `pnpm check`, this is a **required-CI-visible**
+change: the safety gate goes red until every consumer moves in the same commit.
+
+**Sequencing:** land this reshape as the **first self-contained commit**, before
+any dependency, readiness, or base-propagation logic, so the breaking API change
+is reviewable in isolation and CI proves the single-node path is unchanged under
+the new shape. An existing one-node Mission becomes a one-element `tasks` array
+with `dependsOn: []` and a rollup equal to that node's state — exactly today's
+truth.
 
 ## Acceptance criteria
 
