@@ -345,6 +345,22 @@ describe('Milestone 2: one promoted change', () => {
     expect(downstream?.reason).not.toMatch(/Retry/u)
     expect(downstream?.reason).toContain('approved')
     expect(view.derivedState).toBe('complete')
+
+    // Criterion 11's second half: promotion governs what Forgeyard requires,
+    // not what it permits. A terminal node need not be promoted, but promoting
+    // it stays available and succeeds when the operator chooses it.
+    const approvedB = await engine.attemptView(runningB.attempt.id)
+    expect(approvedB.promotion).toMatchObject({ status: 'eligible', eligible: true })
+    const promotedB = await promote(approvedB)
+    expect(promotedB.promotion).toMatchObject({ status: 'promoted' })
+    expect(promotedB.promotion.outputCommit).toMatch(/^[0-9a-f]{40,64}$/u)
+    // B's promoted commit descends from A's, so the chain is real end to end.
+    expect(
+      await gitText(repositoryPath, ['git', 'merge-base', '--is-ancestor', outputCommit, promotedB.promotion.outputCommit as string]),
+    ).toBeDefined()
+    const afterTerminalPromotion = await engine.missionView(mission.mission.id)
+    expect(afterTerminalPromotion.tasks[1]?.attempts.at(-1)?.promotion.status).toBe('promoted')
+    expect(afterTerminalPromotion.derivedState).toBe('complete')
   })
 
   it('surfaces why an approved upstream still cannot be promoted instead of a generic instruction', async () => {

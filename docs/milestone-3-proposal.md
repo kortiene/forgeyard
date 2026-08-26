@@ -1,9 +1,9 @@
 # Milestone 3 proposal — One Useful Pipe
 
-- Status: **Largely implemented in bounded slices.** The plural Mission view,
-  serial one-/two-node creation, atomic Task materialization, and dependency
-  satisfaction through re-verified promoted output are implemented. Remaining:
-  the terminal-node unpromoted-output Cockpit warning (criterion 11).
+- Status: **Implemented in bounded slices.** The plural Mission view, serial
+  one-/two-node creation, atomic Task materialization, dependency satisfaction
+  through re-verified promoted output, and the terminal-node unpromoted-output
+  warning are all implemented.
 - DSH release: `0.1.1-rc.2` (`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`) — unchanged.
 - Revision 3. Five P1 findings from automated review were verified against the
   implementation and **all five were correct**; see [Corrections](#corrections-in-revision-2).

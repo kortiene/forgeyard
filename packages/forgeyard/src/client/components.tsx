@@ -427,6 +427,32 @@ function MissionDetail({
   )
 }
 
+/**
+ * Criterion 11: an approved terminal node whose output has not been promoted
+ * still carries deliverable work, and promotion is the only way to deliver it —
+ * approval cannot be retried into a fresh Attempt, and a drifted reviewed state
+ * makes that exact output permanently unpromotable. Warn while promotion is
+ * still available; say nothing once it is promoted, blocked (the reason line
+ * already says why), or already lost.
+ */
+function UnpromotedOutputWarning({ attempts }: { readonly attempts: AttemptView[] }): ReactNode {
+  const latest = attempts.at(-1)
+  // Only an approved Attempt whose output is still promotable right now.
+  // Once any Promotion exists, or promotion is no longer offered, the
+  // readiness/promotion reason line already says what is true.
+  if (latest === undefined || latest.attempt.state !== 'approved') return null
+  if (latest.promotions.length !== 0) return null
+  if (latest.promotion.eligible !== true) return null
+  return (
+    <p className="fy-node-warning" role="status">
+      <strong>Approved output not yet promoted.</strong> This approved work is
+      undelivered. Promoting it remains available; if its reviewed state drifts
+      first, this exact output becomes permanently unpromotable and cannot be
+      recovered by a retry.
+    </p>
+  )
+}
+
 function MissionNode({
   cockpit,
   missionId,
@@ -462,6 +488,7 @@ function MissionNode({
         <span>{attempts.length} attempt{attempts.length === 1 ? '' : 's'}</span>
       </div>
       {node.readiness.reason === null ? null : <p className="fy-node-reason">{node.readiness.reason}</p>}
+      <UnpromotedOutputWarning attempts={attempts} />
       <div className="fy-node-actions">
         <button
           type="button"
