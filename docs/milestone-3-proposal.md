@@ -1,8 +1,9 @@
 # Milestone 3 proposal — One Useful Pipe
 
-- Status: **Partially implemented in bounded slices.** The plural Mission view is
-  merged; serial one-/two-node creation and atomic Task materialization are in
-  progress. Dependency satisfaction and promoted-base execution remain pending.
+- Status: **Largely implemented in bounded slices.** The plural Mission view,
+  serial one-/two-node creation, atomic Task materialization, and dependency
+  satisfaction through re-verified promoted output are implemented. Remaining:
+  the terminal-node unpromoted-output Cockpit warning (criterion 11).
 - DSH release: `0.1.1-rc.2` (`b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`) — unchanged.
 - Revision 3. Five P1 findings from automated review were verified against the
   implementation and **all five were correct**; see [Corrections](#corrections-in-revision-2).
@@ -22,13 +23,14 @@ Decision → Promotion`. What they did **not** prove is that Forgeyard is a
 *workspace* rather than a single-attempt review tool.
 
 At proposal time, `createMission` hard-coded one `implement` node and
-materialized exactly one Task. The first slice replaced the singular public view
-with ordered `TaskNodeView[]`. The second slice accepts and atomically
-materializes one root or one root plus one direct serial follow-up, with an
-explicit frozen edge and per-node verifier. The remaining honest gap is
-**dependency satisfaction and output propagation**: B stays blocked until
-Forgeyard can re-verify A's promoted output and freeze that exact commit as B's
-base.
+materialized exactly one Task. Slice 1 replaced the singular public view with
+ordered `TaskNodeView[]`. Slice 2 accepts and atomically materializes one root
+or one root plus one direct serial follow-up. Slice 3 resolves dependency
+satisfaction through `upstreamOutput`, the one function both the readiness
+projection and Attempt admission read, so the Cockpit reason and the engine
+refusal are the same text and a dependency is satisfied only by output
+`promotionEligibility` would still advertise: B freezes A's re-verified
+`outputCommit` as its base, and a deleted or moved upstream ref re-blocks B.
 
 Milestone 3 closes exactly that gap for **two serial nodes** and stops.
 

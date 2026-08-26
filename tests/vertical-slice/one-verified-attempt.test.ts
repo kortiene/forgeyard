@@ -424,8 +424,9 @@ describe('Milestone 1: one verified Attempt', () => {
   })
 
   it('refuses to admit a dependency-bearing node on both the initial and the retry path', async () => {
-    // Public creation now materializes the real two-node serial Pipe. Admission
-    // and base propagation are deliberately still disabled for its follow-up.
+    // A dependency-bearing node executes only on its re-verified upstream
+    // promoted commit. Before A runs, admission refuses on both the initial and
+    // the Retry path — with the same reason the Cockpit renders.
     const mission = await engine.createMission({
       ...missionRequest(),
       title: 'Dependency admission guard',
@@ -458,12 +459,12 @@ describe('Milestone 1: one verified Attempt', () => {
     expect(mission.tasks[1]?.readiness).toMatchObject({
       status: 'blocked', startable: false, blockedBy: ['A'], baseCommit: null, baseFromAttemptId: null,
     })
-    expect(mission.tasks[1]?.readiness.reason).toContain('blocked on A')
+    expect(mission.tasks[1]?.readiness.reason).toContain('Node A has not run yet')
     expect(mission.derivedState).toBe('ready')
 
-    // Initial path: the public entry point refuses a dependency-bearing node.
+    // Initial path: admission refuses with exactly the reason the Cockpit shows.
     await expect(engine.startAttempt(taskB.id)).rejects.toMatchObject<Partial<ForgeyardDomainError>>({ code: 'INVALID_STATE' })
-    await expect(engine.startAttempt(taskB.id)).rejects.toThrow(/dependency admission and base propagation/u)
+    await expect(engine.startAttempt(taskB.id)).rejects.toThrow(/Node A has not run yet/u)
 
     // Seed a structurally valid retryable Attempt on the dependency-bearing
     // node. The insert-phase guard only admits a 'preparing' row; bind the same
@@ -537,7 +538,7 @@ describe('Milestone 1: one verified Attempt', () => {
       attemptId: snapshot.attemptId,
       actor: 'operator',
       rationale: 'A dependency-bearing node must not be retried onto the Mission base ref.',
-    })).rejects.toThrow(/dependency admission and base propagation/u)
+    })).rejects.toThrow(/Node A has not run yet/u)
 
     // The refused retry is side-effect free: the predecessor is byte-for-byte
     // unchanged, no RETRY Decision or successor exists, no Session was admitted,

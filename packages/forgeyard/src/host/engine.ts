@@ -164,6 +164,11 @@ interface PlannedAttempt {
   repository: CanonicalRepository
 }
 
+/** One dependency edge's resolved state: satisfied by a re-verified promoted output, or not. */
+type DependencySatisfaction =
+  | { satisfied: true; baseCommit: string; baseFromAttemptId: AttemptId }
+  | { satisfied: false; status: 'blocked' | 'dead'; reason: string }
+
 interface ValidatedMissionNode {
   key: string
   instruction: string
@@ -454,25 +459,63 @@ export class ForgeyardEngine {
     })
   }
 
+  /**
+   * The re-verified promoted output this Task must freeze as its base, or an
+   * INVALID_STATE refusal carrying exactly the reason the Cockpit renders.
+   *
+   * Rebuilt live from the upstream node's AttemptViews, so admission and the
+   * readiness projection can never disagree, and a dependency is admitted only
+   * on output `promotionEligibility` would still advertise right now.
+   */
+  private async resolveDependencyBase(
+    task: TaskRecord,
+    mission: MissionRecord,
+  ): Promise<{ baseCommit: string; baseFromAttemptId: AttemptId }> {
+    const tasks = this.orderedMissionTasks(mission)
+    const index = tasks.findIndex(candidate => candidate.id === task.id)
+    if (index === -1) {
+      throw new ForgeyardDomainError('INVALID_STATE', `Task ${task.id} is not part of Mission ${mission.id}.`)
+    }
+    const upstreamTasks = tasks.slice(0, index)
+
+    const bases: Array<{ baseCommit: string; baseFromAttemptId: AttemptId }> = []
+    for (const dependencyId of task.dependencies) {
+      const dependency = upstreamTasks.find(candidate => candidate.id === dependencyId)
+      if (dependency === undefined) {
+        throw new ForgeyardDomainError(
+          'INVALID_STATE',
+          `This node's recorded dependencies do not resolve within its Mission: ${dependencyId}.`,
+        )
+      }
+      const attempts: AttemptView[] = []
+      for (const attempt of this.store.attemptsForTask(dependency.id)) {
+        attempts.push(await this.attemptViewUnqueued(attempt.id))
+      }
+      const satisfaction = this.upstreamOutput(dependency, attempts)
+      if (!satisfaction.satisfied) {
+        throw new ForgeyardDomainError('INVALID_STATE', satisfaction.reason)
+      }
+      bases.push(satisfaction)
+    }
+    if (bases.length !== 1) {
+      throw new ForgeyardDomainError(
+        'INVALID_STATE',
+        `This Task has ${bases.length} satisfied dependencies; only one propagated base is representable.`,
+      )
+    }
+    const base = bases[0]
+    if (base === undefined || base.baseCommit.length === 0) {
+      throw new ForgeyardDomainError('INVALID_STATE', 'The upstream promoted output does not name a commit.')
+    }
+    return base
+  }
+
   /** Preflight freezes authority without yet mutating Attempt/Decision state. */
   private async planAttempt(taskId: TaskId, retryOf: AttemptRecord | null): Promise<PlannedAttempt> {
     const task = this.store.task(taskId)
     if (task === undefined) throw new ForgeyardDomainError('NOT_FOUND', `Task ${taskId} was not found`)
     const mission = this.store.mission(task.missionId)
     if (mission === undefined) throw new ForgeyardDomainError('NOT_FOUND', `Mission ${task.missionId} was not found`)
-
-    // A dependency-bearing node must not execute on any base until dependency
-    // admission and base propagation exist. This guards BOTH paths: an initial
-    // Attempt and a Retry successor would each resolve `mission.baseRef` below,
-    // which is the wrong base for a node that must freeze an upstream promoted
-    // commit. Gating it only on the initial path would let a seeded or persisted
-    // retryable Attempt slip a successor through on the Mission base ref.
-    if (task.dependencies.length !== 0) {
-      throw new ForgeyardDomainError(
-        'INVALID_STATE',
-        'This Task has dependencies, but dependency admission and base propagation are not implemented yet.',
-      )
-    }
 
     if (retryOf === null) {
       if (this.store.attemptsForTask(task.id).length !== 0) {
@@ -486,6 +529,15 @@ export class ForgeyardEngine {
       }
     }
 
+    // A dependency-bearing node freezes its re-verified upstream promoted
+    // commit as its base — never the Mission base ref. The repository snapshot
+    // still records the operator checkout, which is the same for every node;
+    // this node's actual base lives in ExecutionSnapshot.baseCommit.
+    let dependencyBase: { baseCommit: string; baseFromAttemptId: AttemptId } | null = null
+    if (task.dependencies.length !== 0) {
+      dependencyBase = await this.resolveDependencyBase(task, mission)
+    }
+
     let repository: CanonicalRepository
     let baseCommit: string
     let repositorySnapshot: MissionRecord['repository']
@@ -493,7 +545,10 @@ export class ForgeyardEngine {
       repository = await this.git.canonicalize(mission.repository.path)
       this.git.assertRepositorySnapshot(repository, mission.repository)
       await this.git.assertClean(repository)
-      baseCommit = await this.git.resolveBase(repository, mission.baseRef)
+      // For a dependency-bearing node this also proves the promoted commit is
+      // still a readable commit object in this repository, so a pruned upstream
+      // output fails admission rather than producing a worktree on nothing.
+      baseCommit = await this.git.resolveBase(repository, dependencyBase?.baseCommit ?? mission.baseRef)
       repositorySnapshot = await this.git.repositorySnapshot(repository, mission.baseRef)
     } catch (error) {
       throw new ForgeyardDomainError('GIT_ERROR', errorText(error))
@@ -1401,28 +1456,18 @@ export class ForgeyardEngine {
   private async missionViewUnqueued(missionId: MissionId): Promise<MissionView> {
     const mission = this.store.mission(missionId)
     if (mission === undefined) throw new ForgeyardDomainError('NOT_FOUND', `Mission ${missionId} was not found`)
-    const materialized = this.store.tasksForMission(mission.id)
-    if (materialized.length === 0) throw new Error('Mission has no materialized Task')
-    // The frozen Pipe — not SQLite insertion time or random Task IDs — owns node
-    // order, so materializing multiple nodes in one transaction can never let
-    // UUID order decide which node the Cockpit renders first. This is a total,
-    // deterministic order that never throws inside the snapshot fan-out: a Task
-    // whose node key is absent from the Pipe (which the creation path does not
-    // produce) sorts last rather than blinding every Mission's view.
-    const nodeOrder = new Map(mission.pipe.nodes.map((node, index) => [node.key, index]))
-    const tasks = [...materialized].sort((left, right) =>
-      (nodeOrder.get(left.sourceNodeKey) ?? Number.MAX_SAFE_INTEGER)
-        - (nodeOrder.get(right.sourceNodeKey) ?? Number.MAX_SAFE_INTEGER)
-      || left.createdAt - right.createdAt
-      || left.id.localeCompare(right.id))
+    const tasks = this.orderedMissionTasks(mission)
     const nodes: TaskNodeView[] = []
+    // Nodes are built in frozen Pipe order, so every dependency of a node has
+    // already been built — with its live promotion re-verification attached —
+    // by the time that node's own readiness is computed.
     for (const task of tasks) {
       const attempts: AttemptView[] = []
       for (const attempt of this.store.attemptsForTask(task.id)) attempts.push(await this.attemptViewUnqueued(attempt.id))
       nodes.push({
         task,
         attempts,
-        readiness: this.taskReadiness(task, tasks, attempts),
+        readiness: this.taskReadiness(task, tasks, attempts, nodes),
         nodeState: attempts.at(-1)?.attempt.state ?? 'ready',
       })
     }
@@ -1430,17 +1475,94 @@ export class ForgeyardEngine {
   }
 
   /**
+   * This Mission's Tasks in frozen Pipe order.
+   *
+   * The Pipe — not SQLite insertion time or random Task IDs — owns node order,
+   * so materializing multiple nodes in one transaction can never let UUID order
+   * decide which node the Cockpit renders first. This is a total, deterministic
+   * order that never throws inside the snapshot fan-out: a Task whose node key
+   * is absent from the Pipe (which the creation path does not produce) sorts
+   * last rather than blinding every Mission's view.
+   */
+  private orderedMissionTasks(mission: MissionRecord): TaskRecord[] {
+    const materialized = this.store.tasksForMission(mission.id)
+    if (materialized.length === 0) throw new Error('Mission has no materialized Task')
+    const nodeOrder = new Map(mission.pipe.nodes.map((node, index) => [node.key, index]))
+    return [...materialized].sort((left, right) =>
+      (nodeOrder.get(left.sourceNodeKey) ?? Number.MAX_SAFE_INTEGER)
+        - (nodeOrder.get(right.sourceNodeKey) ?? Number.MAX_SAFE_INTEGER)
+      || left.createdAt - right.createdAt
+      || left.id.localeCompare(right.id))
+  }
+
+  /**
+   * Satisfied upstream output for one dependency edge, or why it is not satisfied.
+   *
+   * This is the single source of truth for Milestone 3 readiness: the Cockpit
+   * renders its `reason` verbatim and `planAttempt` refuses admission with the
+   * same text, so the two can never disagree. It reads only the upstream node's
+   * `AttemptView[]`, whose `promotion` field was produced by
+   * `promotionEligibility` — so a dependency is satisfied only by output that
+   * same function would still advertise: re-verified against the live ref, not
+   * merely recorded as promoted in SQLite.
+   */
+  private upstreamOutput(upstreamTask: TaskRecord, upstreamAttempts: AttemptView[]): DependencySatisfaction {
+    if (upstreamAttempts.length === 0) {
+      return {
+        satisfied: false,
+        status: 'blocked',
+        reason: `Node ${upstreamTask.sourceNodeKey} has not run yet; it must reach an approved, promoted Attempt first.`,
+      }
+    }
+    let promoted: { baseCommit: string; baseFromAttemptId: AttemptId } | null = null
+    let divergedReason: string | null = null
+    let uncertainReason: string | null = null
+    for (const view of upstreamAttempts) {
+      if (view.promotion.status === 'promoted') {
+        if (promoted === null) promoted = { baseCommit: view.promotion.outputCommit ?? '', baseFromAttemptId: view.attempt.id }
+      } else if (view.promotion.status === 'diverged') {
+        if (divergedReason === null) divergedReason = view.promotion.reason ?? `Node ${upstreamTask.sourceNodeKey}'s promoted output no longer holds.`
+      } else if (view.promotion.status === 'uncertain') {
+        if (uncertainReason === null) uncertainReason = view.promotion.reason ?? 'A promotion has not settled yet.'
+      }
+    }
+    const latest = upstreamAttempts.at(-1)?.attempt
+    if (latest?.state === 'rejected') {
+      return {
+        satisfied: false,
+        status: 'dead',
+        reason: `Node ${upstreamTask.sourceNodeKey} was rejected, which is terminal for that Task; create a new Mission for another line of work.`,
+      }
+    }
+    if (divergedReason !== null) return { satisfied: false, status: 'blocked', reason: divergedReason }
+    if (uncertainReason !== null) return { satisfied: false, status: 'blocked', reason: uncertainReason }
+    if (promoted !== null && promoted.baseCommit.length > 0) return { satisfied: true, ...promoted }
+    if (latest?.state === 'approved') {
+      return {
+        satisfied: false,
+        status: 'blocked',
+        reason: `Node ${upstreamTask.sourceNodeKey} is approved but its output has not been promoted yet; promote it first.`,
+      }
+    }
+    return {
+      satisfied: false,
+      status: 'blocked',
+      reason: `Node ${upstreamTask.sourceNodeKey} has not reached a terminal approved Attempt; its latest Attempt is ${latest?.state ?? 'unknown'}.`,
+    }
+  }
+
+  /**
    * Readiness for one node, computed fresh from existing records. It is never
    * stored: a stored copy would drift from the records it summarizes.
    *
    * A root node resolves to `ready` (startable only until its first Attempt
-   * exists). A materialized serial follow-up reports `blocked`; dependency
-   * satisfaction, promotion re-validation, and base propagation are the next
-   * slice. This projection fails
-   * soft on inconsistent dependency records rather than throwing inside the
-   * snapshot fan-out, so one bad row cannot blind the whole Cockpit.
+   * exists). A dependency-bearing node resolves through `upstreamOutput`, so it
+   * becomes startable exactly when a re-verified promoted upstream commit exists
+   * to freeze as its base. This projection fails soft on inconsistent dependency
+   * records rather than throwing inside the snapshot fan-out, so one bad row
+   * cannot blind the whole Cockpit.
    */
-  private taskReadiness(task: TaskRecord, missionTasks: TaskRecord[], attempts: AttemptView[]): TaskReadiness {
+  private taskReadiness(task: TaskRecord, missionTasks: TaskRecord[], attempts: AttemptView[], builtNodes: TaskNodeView[]): TaskReadiness {
     // Resolve each dependency TaskId to its node key. A dependency that does not
     // resolve is corruption — the creation path never writes one — but the view
     // must fail soft exactly as `promotionEligibility` does: one inconsistent
@@ -1490,13 +1612,49 @@ export class ForgeyardEngine {
         baseFromAttemptId: null,
       }
     }
+
+    // Dependency-bearing node: resolve every edge through the same
+    // upstreamOutput the engine will refuse admission with. Pipe order
+    // guarantees each dependency's view is already in builtNodes.
+    const satisfactions: DependencySatisfaction[] = []
+    for (const dependencyId of task.dependencies) {
+      const dependency = missionTasks.find(candidate => candidate.id === dependencyId)
+      const upstreamView = dependency === undefined
+        ? undefined
+        : builtNodes.find(node => node.task.id === dependencyId)
+      if (dependency === undefined || upstreamView === undefined) continue // reported above as unresolved
+      satisfactions.push(this.upstreamOutput(dependency, upstreamView.attempts))
+    }
+    const unsatisfied = satisfactions.find(item => !item.satisfied)
+    if (unsatisfied !== undefined) {
+      return {
+        status: unsatisfied.status,
+        startable: false,
+        reason: unsatisfied.reason,
+        blockedBy,
+        baseCommit: null,
+        baseFromAttemptId: null,
+      }
+    }
+    const bases = satisfactions.filter(item => item.satisfied)
+    if (bases.length !== 1) {
+      // A serial Pipe expresses exactly one propagated base. If a wider graph
+      // ever becomes representable, this must be designed, not guessed.
+      throw new Error(`Task ${task.id} has ${bases.length} satisfied dependencies; only one propagated base is representable.`)
+    }
+    const base = bases[0]
+    if (base === undefined) throw new Error('satisfied dependency disappeared')
+    const ownLatest = attempts.at(-1)?.attempt
+    const startable = ownLatest === undefined
     return {
-      status: 'blocked',
-      startable: false,
-      reason: `This node is blocked on ${blockedBy.join(', ')}. Forgeyard must re-verify approved, promoted upstream output and freeze that commit as this node's base; that admission path is not implemented yet.`,
-      blockedBy,
-      baseCommit: null,
-      baseFromAttemptId: null,
+      status: 'ready',
+      startable,
+      reason: startable
+        ? null
+        : 'The first Attempt already exists; use Retry to create an immutable successor.',
+      blockedBy: [],
+      baseCommit: base.baseCommit,
+      baseFromAttemptId: base.baseFromAttemptId,
     }
   }
 
