@@ -255,6 +255,133 @@ describe('Milestone 2: one promoted change', () => {
     return record
   }
 
+  it('blocks a follow-up whose upstream promotion could not be re-verified, and never recommends an impossible Retry', async () => {
+    const mission = await engine.createMission({
+      ...missionRequest(),
+      title: 'Unconfirmed upstream output',
+      nodes: [
+        { key: 'A', task: 'Implement A.', verificationCommand: 'node verify.mjs', dependsOn: [] },
+        { key: 'B', task: 'Implement B on top of A.', verificationCommand: 'node verify.mjs', dependsOn: ['A'] },
+      ],
+    })
+    const taskA = mission.tasks[0]?.task
+    const taskB = mission.tasks[1]?.task
+    if (taskA === undefined || taskB === undefined) throw new Error('serial Mission did not materialize both Tasks')
+
+    const runningA = await engine.startAttempt(taskA.id)
+    await engine.verifyAttempt(runningA.attempt.id)
+    const approvedA = await engine.decide({
+      attemptId: runningA.attempt.id,
+      type: 'APPROVE',
+      actor: 'operator',
+      rationale: 'Trusted verification passed against this exact review.',
+    })
+    const promotedA = await promote(approvedA)
+    expect(promotedA.promotion.status).toBe('promoted')
+    const readyView = await engine.missionView(mission.mission.id)
+    expect(readyView.tasks[1]?.readiness).toMatchObject({ status: 'ready', startable: true })
+
+    // Make the repository unreadable so re-verifying the ref fails with an
+    // ordinary Git error. That is deliberately NOT divergence: the record
+    // stands and says the output could not be confirmed. A dependency must not
+    // freeze a commit whose authoritative ref was never confirmed, because a
+    // raw commit OID resolves even when the ref that named it is gone.
+    await chmod(repositoryPath, 0o000)
+    try {
+      const unconfirmedView = await engine.missionView(mission.mission.id)
+      const upstreamPanel = unconfirmedView.tasks[0]?.attempts.at(-1)?.promotion
+      expect(upstreamPanel?.status).toBe('promoted')
+      expect(upstreamPanel?.reason).toContain('could not be confirmed')
+      const downstream = unconfirmedView.tasks[1]?.readiness
+      expect(downstream).toMatchObject({
+        status: 'blocked', startable: false, blockedBy: ['A'], baseCommit: null, baseFromAttemptId: null,
+      })
+      expect(downstream?.reason).toContain('could not be re-verified')
+      await expect(engine.startAttempt(taskB.id)).rejects.toThrow(/could not be re-verified/u)
+    } finally {
+      await chmod(repositoryPath, 0o755)
+    }
+
+    // Readable again: the ref re-verifies and B becomes startable once more.
+    const recoveredView = await engine.missionView(mission.mission.id)
+    expect(recoveredView.tasks[1]?.readiness).toMatchObject({ status: 'ready', startable: true })
+  })
+
+  it('words a satisfied terminal follow-up\'s readiness for its actual state instead of recommending Retry', async () => {
+    const mission = await engine.createMission({
+      ...missionRequest(),
+      title: 'Terminal downstream wording',
+      nodes: [
+        { key: 'A', task: 'Implement A.', verificationCommand: 'node verify.mjs', dependsOn: [] },
+        { key: 'B', task: 'Implement B on top of A.', verificationCommand: 'node verify.mjs', dependsOn: ['A'] },
+      ],
+    })
+    const taskA = mission.tasks[0]?.task
+    const taskB = mission.tasks[1]?.task
+    if (taskA === undefined || taskB === undefined) throw new Error('serial Mission did not materialize both Tasks')
+
+    const runningA = await engine.startAttempt(taskA.id)
+    await engine.verifyAttempt(runningA.attempt.id)
+    const approvedA = await engine.decide({
+      attemptId: runningA.attempt.id, type: 'APPROVE', actor: 'operator',
+      rationale: 'Trusted verification passed against this exact review.',
+    })
+    const promotedA = await promote(approvedA)
+    const outputCommit = promotedA.promotion.outputCommit as string
+
+    const runningB = await engine.startAttempt(taskB.id)
+    expect(runningB.attempt.baseCommit).toBe(outputCommit)
+    await engine.verifyAttempt(runningB.attempt.id)
+    await engine.decide({
+      attemptId: runningB.attempt.id, type: 'APPROVE', actor: 'operator',
+      rationale: 'The follow-up passed its own verification.',
+    })
+
+    const view = await engine.missionView(mission.mission.id)
+    const downstream = view.tasks[1]?.readiness
+    expect(downstream).toMatchObject({ status: 'ready', startable: false, baseCommit: outputCommit })
+    // An approved Attempt is not retryable, so the rendered reason must not
+    // tell the operator to use Retry.
+    expect(downstream?.reason).not.toMatch(/Retry/u)
+    expect(downstream?.reason).toContain('approved')
+    expect(view.derivedState).toBe('complete')
+  })
+
+  it('surfaces why an approved upstream still cannot be promoted instead of a generic instruction', async () => {
+    const mission = await engine.createMission({
+      ...missionRequest(),
+      title: 'Stale approved upstream',
+      nodes: [
+        { key: 'A', task: 'Implement A.', verificationCommand: 'node verify.mjs', dependsOn: [] },
+        { key: 'B', task: 'Implement B on top of A.', verificationCommand: 'node verify.mjs', dependsOn: ['A'] },
+      ],
+    })
+    const taskA = mission.tasks[0]?.task
+    const taskB = mission.tasks[1]?.task
+    if (taskA === undefined || taskB === undefined) throw new Error('serial Mission did not materialize both Tasks')
+
+    const runningA = await engine.startAttempt(taskA.id)
+    await engine.verifyAttempt(runningA.attempt.id)
+    await engine.decide({
+      attemptId: runningA.attempt.id, type: 'APPROVE', actor: 'operator',
+      rationale: 'Trusted verification passed against this exact review.',
+    })
+
+    // A drifts after approval: the review digest no longer matches, so
+    // promotion is blocked with the stale-review reason. B must surface that
+    // exact reason rather than advise a promotion that would fail — and an
+    // approved Attempt cannot be retried to reach another state.
+    await writeFile(join(runningA.attempt.worktreePath, 'post-approval.txt'), 'drift\n')
+    const view = await engine.missionView(mission.mission.id)
+    const upstreamPanel = view.tasks[0]?.attempts.at(-1)?.promotion
+    expect(upstreamPanel?.status).toBe('blocked')
+    expect(upstreamPanel?.reason).toMatch(/no longer (?:current|matches)|stale/u)
+    const downstream = view.tasks[1]?.readiness
+    expect(downstream).toMatchObject({ status: 'blocked', startable: false })
+    expect(downstream?.reason).toContain('cannot be promoted')
+    expect(downstream?.reason).not.toContain('promote it first')
+  })
+
   it('admits a serial follow-up only on the re-verified promoted upstream commit, and re-blocks it when that output diverges', async () => {
     const mission = await engine.createMission({
       ...missionRequest(),

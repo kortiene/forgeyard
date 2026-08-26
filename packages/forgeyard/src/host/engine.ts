@@ -164,6 +164,15 @@ interface PlannedAttempt {
   repository: CanonicalRepository
 }
 
+/**
+ * Prefix `promotionEligibility` puts on a completed promotion whose ref could not
+ * be re-verified right now (for example a Git timeout). That case keeps
+ * `status: 'promoted'` for the Attempt panel, but a dependency must NOT treat it
+ * as satisfied: the authoritative ref was not confirmed. Both the producer and
+ * `upstreamOutput` reference this one symbol so they cannot drift.
+ */
+const PROMOTION_UNCONFIRMED_REASON_PREFIX = 'That could not be confirmed'
+
 /** One dependency edge's resolved state: satisfied by a re-verified promoted output, or not. */
 type DependencySatisfaction =
   | { satisfied: true; baseCommit: string; baseFromAttemptId: AttemptId }
@@ -480,11 +489,17 @@ export class ForgeyardEngine {
 
     const bases: Array<{ baseCommit: string; baseFromAttemptId: AttemptId }> = []
     for (const dependencyId of task.dependencies) {
+      // Word the refusal exactly as the readiness projection does, so the reason
+      // the operator sees in the Cockpit and the reason admission refuses are
+      // the same text even for corrupted rows.
+      const anywhere = tasks.find(candidate => candidate.id === dependencyId)
       const dependency = upstreamTasks.find(candidate => candidate.id === dependencyId)
       if (dependency === undefined) {
         throw new ForgeyardDomainError(
           'INVALID_STATE',
-          `This node's recorded dependencies do not resolve within its Mission: ${dependencyId}.`,
+          anywhere === undefined
+            ? `This node's recorded dependencies do not resolve within its Mission: ${dependencyId}.`
+            : `Node ${dependencyId} is not an earlier node of this Mission's Pipe, so its promoted output cannot be resolved. The dependency records are inconsistent and must be inspected.`,
         )
       }
       const attempts: AttemptView[] = []
@@ -1381,7 +1396,7 @@ export class ForgeyardEngine {
         return {
           ...base,
           status: 'promoted',
-          reason: `This Attempt was already promoted to ${active.outputRef} at ${active.outputCommit}. That could not be confirmed: ${errorText(error)}`,
+          reason: `This Attempt was already promoted to ${active.outputRef} at ${active.outputCommit}. ${PROMOTION_UNCONFIRMED_REASON_PREFIX}: ${errorText(error)}`,
         }
       }
       if (symbolic !== null) {
@@ -1517,9 +1532,19 @@ export class ForgeyardEngine {
     let promoted: { baseCommit: string; baseFromAttemptId: AttemptId } | null = null
     let divergedReason: string | null = null
     let uncertainReason: string | null = null
+    let unconfirmedReason: string | null = null
     for (const view of upstreamAttempts) {
       if (view.promotion.status === 'promoted') {
-        if (promoted === null) promoted = { baseCommit: view.promotion.outputCommit ?? '', baseFromAttemptId: view.attempt.id }
+        if (view.promotion.reason?.includes(PROMOTION_UNCONFIRMED_REASON_PREFIX)) {
+          // The SQLite row says promoted, but the authoritative ref could not be
+          // re-verified right now. The Attempt panel keeps advertising the
+          // recorded output; a dependency must not, because admission would
+          // otherwise freeze a commit whose ref was never confirmed — and a raw
+          // commit OID resolves even when the ref that named it is gone.
+          if (unconfirmedReason === null) unconfirmedReason = view.promotion.reason
+        } else if (promoted === null) {
+          promoted = { baseCommit: view.promotion.outputCommit ?? '', baseFromAttemptId: view.attempt.id }
+        }
       } else if (view.promotion.status === 'diverged') {
         if (divergedReason === null) divergedReason = view.promotion.reason ?? `Node ${upstreamTask.sourceNodeKey}'s promoted output no longer holds.`
       } else if (view.promotion.status === 'uncertain') {
@@ -1536,8 +1561,29 @@ export class ForgeyardEngine {
     }
     if (divergedReason !== null) return { satisfied: false, status: 'blocked', reason: divergedReason }
     if (uncertainReason !== null) return { satisfied: false, status: 'blocked', reason: uncertainReason }
+    if (unconfirmedReason !== null) {
+      return {
+        satisfied: false,
+        status: 'blocked',
+        reason: `Node ${upstreamTask.sourceNodeKey}'s promoted output could not be re-verified, so it cannot be frozen as a base yet. ${unconfirmedReason}`,
+      }
+    }
     if (promoted !== null && promoted.baseCommit.length > 0) return { satisfied: true, ...promoted }
     if (latest?.state === 'approved') {
+      // Preserve exactly why this approved Attempt cannot be promoted right now,
+      // including a stale review or an invalid Promotion record: the generic
+      // "promote it first" advice would name an action that fails, and an
+      // approved Attempt cannot be retried to get here another way.
+      const blockedEligibility = upstreamAttempts
+        .map(view => view.promotion)
+        .find(eligibility => eligibility.status === 'blocked' && eligibility.reason !== null)
+      if (blockedEligibility?.reason !== undefined) {
+        return {
+          satisfied: false,
+          status: 'blocked',
+          reason: `Node ${upstreamTask.sourceNodeKey} is approved but cannot be promoted: ${blockedEligibility.reason}`,
+        }
+      }
       return {
         satisfied: false,
         status: 'blocked',
@@ -1549,6 +1595,27 @@ export class ForgeyardEngine {
       status: 'blocked',
       reason: `Node ${upstreamTask.sourceNodeKey} has not reached a terminal approved Attempt; its latest Attempt is ${latest?.state ?? 'unknown'}.`,
     }
+  }
+
+  /**
+   * Why a node that already has an Attempt cannot start another initial one,
+   * worded for that Attempt's actual state. Recommending Retry for an approved,
+   * rejected, or cancelled Attempt would advise an action the engine refuses.
+   */
+  private static admissionReason(latest: AttemptRecord): string {
+    if (RETRYABLE_STATES.has(latest.state)) {
+      return 'The first Attempt already exists; use Retry to create an immutable successor.'
+    }
+    if (latest.state === 'rejected') {
+      return 'This Task was rejected and is terminal; create a new Mission for another line of work.'
+    }
+    if (latest.state === 'cancelled') {
+      return 'This Task was cancelled and is terminal; create a new Mission for another line of work.'
+    }
+    if (latest.state === 'approved') {
+      return 'This Task is approved; starting another initial Attempt is not allowed.'
+    }
+    return `Attempt ${latest.id} already exists in state ${latest.state}; a second initial Attempt is not allowed.`
   }
 
   /**
@@ -1588,25 +1655,10 @@ export class ForgeyardEngine {
     }
     if (blockedBy.length === 0) {
       const latest = attempts.at(-1)?.attempt
-      const startable = latest === undefined
-      let reason: string | null = null
-      if (latest !== undefined) {
-        if (RETRYABLE_STATES.has(latest.state)) {
-          reason = 'The first Attempt already exists; use Retry to create an immutable successor.'
-        } else if (latest.state === 'rejected') {
-          reason = 'This Task was rejected and is terminal; create a new Mission for another line of work.'
-        } else if (latest.state === 'cancelled') {
-          reason = 'This Task was cancelled and is terminal; create a new Mission for another line of work.'
-        } else if (latest.state === 'approved') {
-          reason = 'This Task is approved; starting another initial Attempt is not allowed.'
-        } else {
-          reason = `Attempt ${latest.id} already exists in state ${latest.state}; a second initial Attempt is not allowed.`
-        }
-      }
       return {
         status: 'ready',
-        startable,
-        reason,
+        startable: latest === undefined,
+        reason: latest === undefined ? null : ForgeyardEngine.admissionReason(latest),
         blockedBy: [],
         baseCommit: null,
         baseFromAttemptId: null,
@@ -1615,14 +1667,22 @@ export class ForgeyardEngine {
 
     // Dependency-bearing node: resolve every edge through the same
     // upstreamOutput the engine will refuse admission with. Pipe order
-    // guarantees each dependency's view is already in builtNodes.
+    // guarantees each dependency's view is already in builtNodes — but a
+    // corrupted row pointing at itself or a later node resolves to a Task with
+    // no built view, and that must read as an unresolvable dependency rather
+    // than throwing inside the snapshot fan-out.
     const satisfactions: DependencySatisfaction[] = []
     for (const dependencyId of task.dependencies) {
       const dependency = missionTasks.find(candidate => candidate.id === dependencyId)
-      const upstreamView = dependency === undefined
-        ? undefined
-        : builtNodes.find(node => node.task.id === dependencyId)
-      if (dependency === undefined || upstreamView === undefined) continue // reported above as unresolved
+      const upstreamView = builtNodes.find(node => node.task.id === dependencyId)
+      if (dependency === undefined || upstreamView === undefined) {
+        satisfactions.push({
+          satisfied: false,
+          status: 'blocked',
+          reason: `Node ${dependencyId} is not an earlier node of this Mission's Pipe, so its promoted output cannot be resolved. The dependency records are inconsistent and must be inspected.`,
+        })
+        continue
+      }
       satisfactions.push(this.upstreamOutput(dependency, upstreamView.attempts))
     }
     const unsatisfied = satisfactions.find(item => !item.satisfied)
@@ -1637,21 +1697,26 @@ export class ForgeyardEngine {
       }
     }
     const bases = satisfactions.filter(item => item.satisfied)
+    // A serial Pipe expresses exactly one propagated base. This projection
+    // reports rather than throws: a wider graph is not representable, and one
+    // Mission's malformed rows must not blind the snapshot fan-out.
     if (bases.length !== 1) {
-      // A serial Pipe expresses exactly one propagated base. If a wider graph
-      // ever becomes representable, this must be designed, not guessed.
-      throw new Error(`Task ${task.id} has ${bases.length} satisfied dependencies; only one propagated base is representable.`)
+      return {
+        status: 'blocked',
+        startable: false,
+        reason: `This node has ${bases.length} satisfied dependencies; a serial Pipe propagates exactly one base. The dependency records must be inspected.`,
+        blockedBy,
+        baseCommit: null,
+        baseFromAttemptId: null,
+      }
     }
     const base = bases[0]
     if (base === undefined) throw new Error('satisfied dependency disappeared')
     const ownLatest = attempts.at(-1)?.attempt
-    const startable = ownLatest === undefined
     return {
       status: 'ready',
-      startable,
-      reason: startable
-        ? null
-        : 'The first Attempt already exists; use Retry to create an immutable successor.',
+      startable: ownLatest === undefined,
+      reason: ownLatest === undefined ? null : ForgeyardEngine.admissionReason(ownLatest),
       blockedBy: [],
       baseCommit: base.baseCommit,
       baseFromAttemptId: base.baseFromAttemptId,

@@ -549,6 +549,65 @@ describe('Milestone 1: one verified Attempt', () => {
     expect(sessions.admissions).toEqual([])
   })
 
+  it('renders a dependency that is not an earlier Pipe node as blocked instead of failing the snapshot', async () => {
+    const healthy = await engine.createMission(missionRequest())
+    const seed = await engine.createMission({
+      ...missionRequest(),
+      title: 'Self-referential dependency',
+      nodes: [
+        { key: 'A', task: 'Implement A.', verificationCommand: 'node verify.mjs', dependsOn: [] },
+        { key: 'B', task: 'Implement B.', verificationCommand: 'node verify.mjs', dependsOn: ['A'] },
+      ],
+    })
+    const taskB = seed.tasks[1]?.task
+    if (taskB === undefined) throw new Error('serial Mission did not materialize both Tasks')
+
+    // Seed a corrupted sibling Mission whose only Task depends on itself. The
+    // ID resolves to a real Task, but that Task is never an earlier built node,
+    // so its promoted output cannot be resolved. The view must report blocked
+    // corruption, not throw and blind every Mission in the snapshot fan-out.
+    // (Tasks are immutable, so the row is inserted rather than updated.)
+    const selfReferential = {
+      ...seed.mission,
+      id: 'mission_self_referential_dependency',
+      title: 'Self-referential dependency',
+      createdAt: seed.mission.createdAt + 5,
+    }
+    const selfTask = {
+      ...taskB,
+      id: 'task_self_referential',
+      missionId: selfReferential.id,
+      dependencies: ['task_self_referential'],
+      createdAt: selfReferential.createdAt,
+    }
+    store.immediate(() => {
+      store.database.prepare(`INSERT INTO missions
+        (id,title,objective,repository_json,base_ref,policy_json,pipe_json,pipe_hash,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?)`).run(
+        selfReferential.id, selfReferential.title, selfReferential.objective,
+        canonicalJson(selfReferential.repository), selfReferential.baseRef,
+        canonicalJson(selfReferential.defaultPolicy), canonicalJson(selfReferential.pipe),
+        selfReferential.pipeHash, selfReferential.createdAt,
+      )
+      store.database.prepare(`INSERT INTO tasks
+        (id,mission_id,source_node_key,specification_json,dependencies_json,created_at)
+        VALUES (?,?,?,?,?,?)`).run(
+        selfTask.id, selfTask.missionId, selfTask.sourceNodeKey,
+        canonicalJson(selfTask.specification), canonicalJson(selfTask.dependencies), selfTask.createdAt,
+      )
+    })
+
+    const snapshot = await engine.snapshot()
+    expect(snapshot.missions.find(item => item.mission.id === healthy.mission.id)?.derivedState).toBe('ready')
+    const corrupted = snapshot.missions.find(item => item.mission.id === selfReferential.id)
+    expect(corrupted?.derivedState).toBe('blocked')
+    expect(corrupted?.tasks[0]?.readiness).toMatchObject({
+      status: 'blocked', startable: false, baseCommit: null, baseFromAttemptId: null,
+    })
+    expect(corrupted?.tasks[0]?.readiness.reason).toContain("not an earlier node of this Mission's Pipe")
+    await expect(engine.startAttempt(selfTask.id)).rejects.toThrow(/not an earlier node/u)
+  })
+
   it('persists only the v1 authority tables, enforces append-only records, and fails recovery closed', async () => {
     const mission = await engine.createMission(missionRequest())
     const running = await engine.startAttempt(mission.tasks[0].task.id)
