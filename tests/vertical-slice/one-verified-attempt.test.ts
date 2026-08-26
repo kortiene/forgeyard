@@ -424,8 +424,9 @@ describe('Milestone 1: one verified Attempt', () => {
   })
 
   it('refuses to admit a dependency-bearing node on both the initial and the retry path', async () => {
-    // Public creation now materializes the real two-node serial Pipe. Admission
-    // and base propagation are deliberately still disabled for its follow-up.
+    // A dependency-bearing node executes only on its re-verified upstream
+    // promoted commit. Before A runs, admission refuses on both the initial and
+    // the Retry path — with the same reason the Cockpit renders.
     const mission = await engine.createMission({
       ...missionRequest(),
       title: 'Dependency admission guard',
@@ -458,12 +459,12 @@ describe('Milestone 1: one verified Attempt', () => {
     expect(mission.tasks[1]?.readiness).toMatchObject({
       status: 'blocked', startable: false, blockedBy: ['A'], baseCommit: null, baseFromAttemptId: null,
     })
-    expect(mission.tasks[1]?.readiness.reason).toContain('blocked on A')
+    expect(mission.tasks[1]?.readiness.reason).toContain('Node A has not run yet')
     expect(mission.derivedState).toBe('ready')
 
-    // Initial path: the public entry point refuses a dependency-bearing node.
+    // Initial path: admission refuses with exactly the reason the Cockpit shows.
     await expect(engine.startAttempt(taskB.id)).rejects.toMatchObject<Partial<ForgeyardDomainError>>({ code: 'INVALID_STATE' })
-    await expect(engine.startAttempt(taskB.id)).rejects.toThrow(/dependency admission and base propagation/u)
+    await expect(engine.startAttempt(taskB.id)).rejects.toThrow(/Node A has not run yet/u)
 
     // Seed a structurally valid retryable Attempt on the dependency-bearing
     // node. The insert-phase guard only admits a 'preparing' row; bind the same
@@ -537,7 +538,7 @@ describe('Milestone 1: one verified Attempt', () => {
       attemptId: snapshot.attemptId,
       actor: 'operator',
       rationale: 'A dependency-bearing node must not be retried onto the Mission base ref.',
-    })).rejects.toThrow(/dependency admission and base propagation/u)
+    })).rejects.toThrow(/Node A has not run yet/u)
 
     // The refused retry is side-effect free: the predecessor is byte-for-byte
     // unchanged, no RETRY Decision or successor exists, no Session was admitted,
@@ -546,6 +547,65 @@ describe('Milestone 1: one verified Attempt', () => {
     expect(store.decisions(snapshot.attemptId)).toEqual([])
     expect(store.attemptsForTask(taskB.id).map(item => item.id)).toEqual([snapshot.attemptId])
     expect(sessions.admissions).toEqual([])
+  })
+
+  it('renders a dependency that is not an earlier Pipe node as blocked instead of failing the snapshot', async () => {
+    const healthy = await engine.createMission(missionRequest())
+    const seed = await engine.createMission({
+      ...missionRequest(),
+      title: 'Self-referential dependency',
+      nodes: [
+        { key: 'A', task: 'Implement A.', verificationCommand: 'node verify.mjs', dependsOn: [] },
+        { key: 'B', task: 'Implement B.', verificationCommand: 'node verify.mjs', dependsOn: ['A'] },
+      ],
+    })
+    const taskB = seed.tasks[1]?.task
+    if (taskB === undefined) throw new Error('serial Mission did not materialize both Tasks')
+
+    // Seed a corrupted sibling Mission whose only Task depends on itself. The
+    // ID resolves to a real Task, but that Task is never an earlier built node,
+    // so its promoted output cannot be resolved. The view must report blocked
+    // corruption, not throw and blind every Mission in the snapshot fan-out.
+    // (Tasks are immutable, so the row is inserted rather than updated.)
+    const selfReferential = {
+      ...seed.mission,
+      id: 'mission_self_referential_dependency',
+      title: 'Self-referential dependency',
+      createdAt: seed.mission.createdAt + 5,
+    }
+    const selfTask = {
+      ...taskB,
+      id: 'task_self_referential',
+      missionId: selfReferential.id,
+      dependencies: ['task_self_referential'],
+      createdAt: selfReferential.createdAt,
+    }
+    store.immediate(() => {
+      store.database.prepare(`INSERT INTO missions
+        (id,title,objective,repository_json,base_ref,policy_json,pipe_json,pipe_hash,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?)`).run(
+        selfReferential.id, selfReferential.title, selfReferential.objective,
+        canonicalJson(selfReferential.repository), selfReferential.baseRef,
+        canonicalJson(selfReferential.defaultPolicy), canonicalJson(selfReferential.pipe),
+        selfReferential.pipeHash, selfReferential.createdAt,
+      )
+      store.database.prepare(`INSERT INTO tasks
+        (id,mission_id,source_node_key,specification_json,dependencies_json,created_at)
+        VALUES (?,?,?,?,?,?)`).run(
+        selfTask.id, selfTask.missionId, selfTask.sourceNodeKey,
+        canonicalJson(selfTask.specification), canonicalJson(selfTask.dependencies), selfTask.createdAt,
+      )
+    })
+
+    const snapshot = await engine.snapshot()
+    expect(snapshot.missions.find(item => item.mission.id === healthy.mission.id)?.derivedState).toBe('ready')
+    const corrupted = snapshot.missions.find(item => item.mission.id === selfReferential.id)
+    expect(corrupted?.derivedState).toBe('blocked')
+    expect(corrupted?.tasks[0]?.readiness).toMatchObject({
+      status: 'blocked', startable: false, baseCommit: null, baseFromAttemptId: null,
+    })
+    expect(corrupted?.tasks[0]?.readiness.reason).toContain("not an earlier node of this Mission's Pipe")
+    await expect(engine.startAttempt(selfTask.id)).rejects.toThrow(/not an earlier node/u)
   })
 
   it('persists only the v1 authority tables, enforces append-only records, and fails recovery closed', async () => {

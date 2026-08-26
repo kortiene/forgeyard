@@ -456,6 +456,9 @@ function MissionNode({
       <div className="fy-node-meta">
         <span>{node.task.specification.verification.length} required check{node.task.specification.verification.length === 1 ? '' : 's'}</span>
         <span>{node.task.dependencies.length} dependenc{node.task.dependencies.length === 1 ? 'y' : 'ies'}</span>
+        {node.readiness.baseCommit === null ? null : (
+          <span>base <code>{shortHash(node.readiness.baseCommit)}</code></span>
+        )}
         <span>{attempts.length} attempt{attempts.length === 1 ? '' : 's'}</span>
       </div>
       {node.readiness.reason === null ? null : <p className="fy-node-reason">{node.readiness.reason}</p>}

@@ -342,13 +342,13 @@ try {
     || serialA.readiness?.status !== 'ready' || serialA.readiness?.startable !== true
     || serialB.readiness?.status !== 'blocked' || serialB.readiness?.startable !== false
     || serialB.readiness?.blockedBy?.join(',') !== 'A'
-    || !serialB.readiness?.reason?.includes('blocked on A')
+    || !serialB.readiness?.reason?.includes('Node A has not run yet')
     || serial.derivedState !== 'ready') {
     throw new Error(`Forgeyard did not materialize one honest serial Pipe: ${JSON.stringify(serial)}`)
   }
   const blockedDownstream = await invokeRemote('startAttempt', { taskId: serialB.task.id })
   if (blockedDownstream?.ok !== false || blockedDownstream.error?.code !== 'INVALID_STATE'
-    || !blockedDownstream.error.message.includes('dependency admission and base propagation')) {
+    || !blockedDownstream.error.message.includes('Node A has not run yet')) {
     throw new Error(`Forgeyard admitted downstream Task B before propagated-base support: ${JSON.stringify(blockedDownstream)}`)
   }
   const afterSerial = await remote('snapshot', {})
@@ -357,7 +357,7 @@ try {
     || retainedSerial?.tasks?.length !== 2) {
     throw new Error(`Forgeyard changed serial Pipe authority after refused admission: ${JSON.stringify(retainedSerial)}`)
   }
-  decisionOutcome += ', plus atomic two-node Pipe materialization with downstream admission blocked'
+  decisionOutcome += ', plus atomic two-node Pipe materialization with downstream admission gated on upstream promotion'
 
   child.kill('SIGTERM')
   await Promise.race([
