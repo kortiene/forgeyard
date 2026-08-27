@@ -283,6 +283,71 @@ describe('built Forgeyard browser face', () => {
     for (const cleanup of cleanups.splice(0).reverse()) cleanup()
   })
 
+  it('keeps the undelivered-output warning on a node that reached approval through a retry', async () => {
+    const client = await executeBuiltClientFace()
+    const entries = new Map<string, SlotEntry>()
+    const cleanups: Array<() => void> = []
+
+    const data = snapshotFixture()
+    const node = data.missions[0]?.tasks[0]
+    const attempt = node?.attempts[0]
+    if (node === undefined || attempt === undefined) throw new Error('missing Mission node fixture')
+
+    // Prepend a retried predecessor so the approved Attempt is the LAST entry
+    // in wire order (oldest first) while the display sort puts it FIRST. The
+    // warning must read the latest Attempt, not the display-sorted tail.
+    const predecessor: AttemptView = {
+      ...structuredClone(attempt),
+      attempt: {
+        ...structuredClone(attempt.attempt),
+        id: 'attempt-0',
+        ordinal: 1,
+        retryOfAttemptId: null,
+        successorAttemptId: 'attempt-1',
+        dshSessionId: 'session-0',
+        state: 'retried',
+      },
+    }
+    const approved = structuredClone(attempt)
+    approved.attempt = { ...approved.attempt, id: 'attempt-1', ordinal: 2, state: 'approved' }
+    approved.promotion = {
+      ...approved.promotion,
+      status: 'eligible',
+      eligible: true,
+      reason: null,
+    }
+    node.attempts = [predecessor, approved]
+    node.nodeState = 'approved'
+    node.readiness = {
+      status: 'ready',
+      startable: false,
+      reason: 'This Task is approved; starting another initial Attempt is not allowed.',
+      blockedBy: [],
+      baseCommit: null,
+      baseFromAttemptId: null,
+    }
+    const mission = data.missions[0]
+    if (mission === undefined) throw new Error('missing Mission fixture')
+    mission.derivedState = 'complete'
+
+    const ctx = fakeClientContext(entries, cleanups, data, identityResult, {})
+    await act(async () => { await client.apply(ctx as never) })
+    const footer = await mount(<Slot entry={required(entries, 'sidebar.footer.action')} runtime={{ wide: true }} />)
+    const overlay = await mount(<Slot entry={required(entries, 'shell.overlay')} />)
+    await click(await waitForElement(() => namedButton(footer.container, /Open Forgeyard/u)))
+    await waitForElement(() => overlay.container.querySelector('[role="dialog"]'))
+    await click(requiredElement(namedButton(overlay.container, /Browser mission/u), 'mission button'))
+    const warning = requiredElement(
+      overlay.container.querySelector<HTMLParagraphElement>('p.fy-node-warning[role="status"]'),
+      'unpromoted output warning after retry',
+    )
+    expect(warning.textContent).toContain('Approved output not yet promoted')
+
+    await overlay.unmount()
+    await footer.unmount()
+    for (const cleanup of cleanups.splice(0).reverse()) cleanup()
+  })
+
   it('renders promotion eligibility, requires explicit confirmation, and shows the durable result', async () => {
     const client = await executeBuiltClientFace()
     const entries = new Map<string, SlotEntry>()

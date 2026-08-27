@@ -436,6 +436,11 @@ function MissionDetail({
  * already says why), or already lost.
  */
 function UnpromotedOutputWarning({ attempts }: { readonly attempts: AttemptView[] }): ReactNode {
+  // `attempts` arrives in the wire contract's order — oldest first — so the last
+  // entry is the latest Attempt. It must NOT be handed a display-sorted copy:
+  // MissionNode sorts newest-first for rendering, and reading `.at(-1)` from that
+  // would select the *oldest* Attempt and silently suppress this warning on every
+  // node that reached approval through a retry.
   const latest = attempts.at(-1)
   // Only an approved Attempt whose output is still promotable right now.
   // Once any Promotion exists, or promotion is no longer offered, the
@@ -488,7 +493,7 @@ function MissionNode({
         <span>{attempts.length} attempt{attempts.length === 1 ? '' : 's'}</span>
       </div>
       {node.readiness.reason === null ? null : <p className="fy-node-reason">{node.readiness.reason}</p>}
-      <UnpromotedOutputWarning attempts={attempts} />
+      <UnpromotedOutputWarning attempts={node.attempts} />
       <div className="fy-node-actions">
         <button
           type="button"
