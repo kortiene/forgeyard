@@ -482,6 +482,57 @@ describe('Milestone 2: one promoted change', () => {
     })).rejects.toThrow(/no longer exists/u)
   })
 
+  it('reports a rejected upstream as terminal dead readiness and refuses follow-up admission with the same text', async () => {
+    const mission = await engine.createMission({
+      ...missionRequest(),
+      title: 'Rejected upstream',
+      nodes: [
+        { key: 'A', task: 'Implement A.', verificationCommand: 'node verify.mjs', dependsOn: [] },
+        { key: 'B', task: 'Implement B on top of A.', verificationCommand: 'node verify.mjs', dependsOn: ['A'] },
+      ],
+    })
+    const taskA = mission.tasks[0]?.task
+    const taskB = mission.tasks[1]?.task
+    if (taskA === undefined || taskB === undefined) throw new Error('serial Mission did not materialize both Tasks')
+
+    const runningA = await engine.startAttempt(taskA.id)
+    await engine.verifyAttempt(runningA.attempt.id)
+    const rejectedA = await engine.decide({
+      attemptId: runningA.attempt.id,
+      type: 'REJECT',
+      actor: 'operator',
+      rationale: 'This line of work is finished.',
+    })
+    expect(rejectedA.attempt.state).toBe('rejected')
+
+    // Criterion 9: the dependency reports the terminal `dead` state with the
+    // honest remedy — a new Mission, never a Retry — and the rollup surfaces
+    // the dead branch over A's own terminal rejection.
+    const view = await engine.missionView(mission.mission.id)
+    expect(view.tasks[1]?.readiness).toMatchObject({
+      status: 'dead', startable: false, blockedBy: ['A'], baseCommit: null, baseFromAttemptId: null,
+    })
+    expect(view.tasks[1]?.readiness.reason).toContain('Node A was rejected, which is terminal for that Task')
+    expect(view.tasks[1]?.readiness.reason).toContain('create a new Mission')
+    expect(view.derivedState).toBe('dead')
+
+    // Admission refuses with exactly the readiness reason — the same-text
+    // guarantee, asserted end to end on the dead path.
+    const admission = await engine.startAttempt(taskB.id).then(
+      () => { throw new Error('downstream admission unexpectedly succeeded') },
+      error => error as ForgeyardDomainError,
+    )
+    expect(admission.message).toBe(view.tasks[1]?.readiness.reason)
+
+    // And no back door exists on the upstream: a rejected Attempt is not
+    // retryable, so the remedy the reason names is the only real one.
+    await expect(engine.retry({
+      attemptId: runningA.attempt.id,
+      actor: 'operator',
+      rationale: 'A rejected Attempt must not be retryable.',
+    })).rejects.toThrow(/Retry requires the latest nonterminal reviewable Attempt/u)
+  })
+
   it('promotes exactly the approved deliverable into a durable local ref and leaves the checkout untouched', async () => {
     sessions.authored = async (cwd) => {
       await writeFile(join(cwd, 'result.txt'), 'fixed\n')
