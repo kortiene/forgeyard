@@ -54,8 +54,16 @@ view rather than failing a gate:
 
 `ForgeyardEngine.upstreamOutput` is the **single source of truth** for a
 dependency edge. The readiness projection renders its `reason` verbatim in the
-Cockpit, and Attempt admission refuses with the **same text** — the panel and
-the engine can never disagree. It reads the upstream node's `AttemptView[]`
+Cockpit, and Attempt admission refuses with the **same text** — on any edge
+that resolves, the panel and the engine cannot disagree. One delimited
+exception exists for corrupted rows (which creation never writes; only a
+fixture inserted against the immutability triggers can produce one): a
+dependency ID that does not resolve at all makes the panel fail soft with
+`This node's recorded dependencies do not resolve within its Mission: …` plus
+a trailing `The dependency records are inconsistent and must be inspected.`,
+while the engine refusal names only the unresolvable ID — and the sibling
+*not-an-earlier-node* corruption case does share one text on both sides.
+`upstreamOutput` reads the upstream node's `AttemptView[]`
 whose `promotion` field came from `promotionEligibility`, so a dependency is
 satisfied only by output that function **would still advertise right now**:
 re-verified against the live `refs/forgeyard/promotions/<attemptId>` ref, not
@@ -63,7 +71,8 @@ merely recorded as `promoted` in SQLite.
 
 | Upstream condition | B readiness | Reason (verbatim prefix) |
 | --- | --- | --- |
-| no Attempt yet, or not terminal | `blocked` | `Node A has not run yet; it must reach an approved, promoted Attempt first.` / `…its latest Attempt is <state>.` |
+| no Attempt yet, or no terminal approved Attempt | `blocked` | `Node A has not run yet; it must reach an approved, promoted Attempt first.` / `…its latest Attempt is <state>.` |
+| latest Attempt `cancelled` | `blocked` | `Node A has not reached a terminal approved Attempt; its latest Attempt is cancelled.` — cancellation is **terminal** for the Task (no Retry, no second initial Attempt), so the remedy is a new Mission; it is reported `blocked` rather than `dead` by design (proposal Q3) |
 | latest Attempt `approved`, not promoted | `blocked` | `Node A is approved but its output has not been promoted yet; promote it first.` |
 | `approved` but promotion currently blocked (e.g. drifted review) | `blocked` | `Node A is approved but cannot be promoted: <the actual promotionEligibility reason>` — never the generic advice, because naming an action that would fail is worse than saying nothing |
 | promotion recorded but ref not re-verifiable **right now** (e.g. repository unreadable) | `blocked` | `Node A's promoted output could not be re-verified, so it cannot be frozen as a base yet. <reason>` — the shared `PROMOTION_UNCONFIRMED_REASON_PREFIX` constant is what links the panel and this refusal |
@@ -87,12 +96,12 @@ criterion lacks executed coverage, the gap is stated rather than papered over.
 | --- | --- | --- |
 | 1 | two-node materialization; B's `dependencies` holds A's `TaskId` | `smoke:profile` (real pinned profile, generated Remote) creates the serial Mission and asserts the frozen Pipe, node/Task correspondence, and `dependencies`; `tests/vertical-slice/store-authority.test.ts` asserts every atomicity and correspondence failure mode of `insertMissionAndTasks`; `one-verified-attempt` asserts Pipe-order node views |
 | 2 | B `blocked` and `startAttempt(B)` refused by the Host engine | `smoke:profile` asserts the Remote refusal (`INVALID_STATE`, same text as the panel); `one-promoted-change` "admits a serial follow-up only on the re-verified…" asserts `startAttempt` rejects `/Node A has not run yet/`; `one-verified-attempt` refuses admission on initial **and** retry paths |
-| 3 | A executes in its own Session/worktree, passes, is approved and promoted | machinery identical to Milestones 1–2: `smoke:native` drives the real-model version (currently blocked by provider quota, below); `smoke:profile` drives it on the real pinned profile with the harness Session; `one-promoted-change` drives it in the vertical slice |
+| 3 | A executes in its own Session/worktree, passes, is approved and promoted | **in a serial Mission, only the vertical slice executes A** (`one-promoted-change`: start → verify → `APPROVE` → promote of the serial A, deterministic harness-authored worktree content). `smoke:profile` proves the *machinery* on the real pinned profile but its executed-and-promoted Attempt belongs to the **single-node** Mission; the serial Mission in that run is only materialized and refusal-checked. `smoke:native` would drive the real-model version but is currently quota-blocked (below) and is single-node regardless |
 | 4 | B `ready` only after promotion **and** ref re-verification; deleting/moving the ref re-blocks B | `one-promoted-change` deletes the ref (`git update-ref -d`) and asserts B returns to `blocked` with the divergence surfaced verbatim; a sibling test makes the repository unreadable and asserts the *unconfirmed* (not diverged) re-block and recovery |
 | 5 | B's `executionSnapshot.baseCommit` equals A's `outputCommit`; worktree HEAD resolves to it | `one-promoted-change` asserts both fields plus `git rev-parse HEAD` inside B's worktree |
 | 6 | distinct Session/worktree; `A.outputCommit` is an ancestor of B's HEAD; A's commit a single child of the Mission base | `one-promoted-change` asserts distinct Session/worktree and `merge-base --is-ancestor` in both directions; single-parent exactness is the Milestone 2 promotion invariant, asserted there (vertical slice and `smoke:profile`'s `rev-list --parents` check) and inherited unchanged by A's promotion |
-| 7 | Cockpit renders nodes, edge, readiness, reason, propagated base; rollup asserted per stage incl. the mixed state | `tests/dsh-contract/mission-view-contract.test.ts` pins the whole precedence table including "promoted A plus startable B is `ready`, not `complete`"; the vertical slice asserts `derivedState` at each serial stage; `client-bundle-render.test.tsx` renders the built bundle's node cards, follow-up submission, and warnings; `smoke:browser` asserts the reshaped node card in real Chromium |
-| 8 | all Evidence/Verification/Decision records for both nodes, and A's Promotion, remain inspectable and append-only | store-authority immutability triggers plus the vertical slice's post-promotion views of both nodes' histories |
+| 7 | Cockpit renders nodes, edge, readiness, reason, propagated base; rollup asserted per stage incl. the mixed state | the **values** are asserted without the graph: `mission-view-contract.test.ts` pins the whole precedence table including "promoted A plus startable B is `ready`, not `complete`", and the vertical slice asserts `derivedState` and each readiness at every serial stage. The **graphical** tests do not render a serial fixture: `client-bundle-render.test.tsx` asserts the two-node *creation payload* but renders single-node snapshots, and `smoke:browser` waits for the single reshaped node card. See honest gap 3 |
+| 8 | all Evidence/Verification/Decision records for both nodes, and A's Promotion, remain inspectable and append-only | append-only is proven **generically** by the store-authority immutability triggers; the serial tests assert both nodes' views, readiness, and A's/B's Promotion records, but do **not** separately walk both nodes' Evidence/Verification/Decision arrays through the plural Mission view |
 | 9 | rejected upstream ⇒ terminal `dead` with an accurate remedy; no impossible `RETRY` offered | **partially covered, honestly:** the rollup's `dead` mapping is pinned by `mission-view-contract` fixtures, and `upstreamOutput` implements the reason — but **no automated test drives a rejected upstream to B's `dead` readiness end-to-end**, and no funded profile run has exercised it either. Until one does, treat this criterion as designed-and-reviewable, not executed. See "Honest gaps" below |
 | 10 | operator branch/index/HEAD/checkout unchanged; no push/PR/merge/CI | `smoke:profile` verifies `for-each-ref`, clean `status --porcelain=v2`, and branch/HEAD from the operator's own checkout after the Host exits; the vertical slice repeats this per scenario |
 | 11 | approved-but-unpromoted terminal B shows an explicit warning; promoting B stays available and succeeds | `client-bundle-render` asserts the warning appears (including after a retry-approved node), and disappears once promoted or blocked; `one-promoted-change` promotes B and asserts `merge-base --is-ancestor A.outputCommit B.outputCommit` |
@@ -124,7 +133,13 @@ git -C <repository> merge-base --is-ancestor <missionBase> <A.outputCommit>
 
 # The deliverables, read straight out of Git
 git -C <repository> diff <missionBase>..<A.outputCommit>
-git -C <B worktree> diff <A.outputCommit>   # B's work-in-progress deliverable
+git -C <B worktree> diff <A.outputCommit>   # B's tracked changes only
+git -C <B worktree> status --short --untracked-files=all   # B's new files
+
+# A's promoted tree already enumerates its additions; B's worktree does not:
+# `git diff <commit>` compares tracked paths and never lists untracked files,
+# so if B's deliverable is pure additions the diff alone shows nothing.
+git -C <repository> ls-tree -r --name-only <A.outputCommit>
 ```
 
 Promoting B afterwards (criterion 11's second half) extends the same chain with
@@ -133,11 +148,15 @@ ordinary Git facts — no Forgeyard machinery is involved in reading it:
 ```sh
 git -C <repository> merge-base --is-ancestor <A.outputCommit> <B.outputCommit> \
   && echo "B descends from A"
+git -C <repository> ls-tree -r --name-only <B.outputCommit>   # B's additions, enumerated
 ```
 
-No command above can move anything: they are all read-only queries against the
-shared object database, and Forgeyard's ref namespace
-(`refs/forgeyard/promotions/`) is the only thing it ever writes.
+Every command above is a read-only query against the shared object database —
+none can move anything. The precise write boundary Forgeyard itself holds: it
+writes **no ref name outside `refs/forgeyard/promotions/`** and never moves an
+operator branch, HEAD, index, or checkout, but admission and promotion do add
+ordinary Git content — new objects in the shared object database, linked
+worktree administration under `.git/worktrees/`, and the promotion ref itself.
 
 ## Re-blocking on divergence
 
@@ -184,10 +203,25 @@ inside the node card:
 > exact output becomes permanently unpromotable and cannot be recovered by a
 > retry.
 
-The warning appears only while it is actionable — an approved latest Attempt,
-no Promotion yet, and `promotionEligibility` still `eligible` — and disappears
-once the node is promoted or the reason line already says something truer
-(blocked, lost). Promoting a terminal node is never *required*; it stays
+The warning appears only while it is actionable — the node's **latest** Attempt
+(in wire order, oldest-first) is `approved`, it holds **zero Promotion records
+of any kind**, and `promotionEligibility` still reports `eligible` — and it
+disappears once the node is promoted or the reason line already says something
+truer (blocked, lost). Two consequences an operator should know:
+
+- After a promotion attempt that **failed before creating the ref**, the
+  retained `failed` Promotion record suppresses the node-card warning even
+  though the output is still undelivered and — per the Milestone 2 semantics —
+  the Attempt is released and an explicit promotion retry remains possible.
+  The Attempt review's Promotion panel still shows the failure and the
+  eligibility; only the node card goes quiet. This is a known cosmetic blind
+  spot, not a delivery guarantee.
+- The warning keys on the wire contract's oldest-first `attempts` order. Feed
+  it a display-sorted copy and it will silently select the *oldest* Attempt
+  and vanish on every node that reached approval through a retry — the
+  retry-chain survival case is what the render suite pins.
+
+Promoting a terminal node is never *required*; it stays
 *available* and succeeds when chosen, proving the rule governs what Forgeyard
 requires, not what it permits.
 
@@ -269,21 +303,34 @@ re-verified on the date above:
 ## Honest gaps at acceptance time
 
 1. **No funded provider route has exercised a real model turn under Milestone
-   3.** `smoke:native` remains single-node (Milestones 1–2); the serial chain's
-   model turns are driven by the harness Session in the profile smoke and the
-   vertical slice. The quota block above is the only obstacle.
+   3.** `smoke:native` remains single-node (Milestones 1–2) and is
+   quota-blocked besides; the serial chain's execution exists only in the
+   deterministic vertical slice, whose worktree content is harness-authored.
+   `smoke:profile` executes and promotes an Attempt on the real pinned
+   profile, but of the **single-node** Mission — the serial Mission in that
+   run is materialized and refusal-checked only. The quota block is the only
+   obstacle to the real-model run.
 2. **Criterion 9's engine path has no end-to-end test** (see the criteria
    map): rejected upstream ⇒ `dead` readiness is implemented and its rollup is
    pinned by fixtures, but no test drives a real `REJECT` on an upstream node
    and asserts B's resulting readiness. Closing this is a bounded follow-up
    and should precede any Milestone 4 proposal that builds on rejection
    semantics.
+3. **No graphical test renders a serial fixture.** The render suites mount
+   single-node snapshots; the two-node browser tests assert the *creation
+   payload*, and `smoke:browser` waits for the single reshaped node card. A
+   regression that dropped the second node card, the dependency edge, the
+   blocking reason, or the propagated base from the Cockpit would pass every
+   cited graphical check. The engine-level readiness and rollup values are
+   pinned; their rendering is not. A two-node render fixture is a bounded
+   follow-up.
 
 ## Interpreting a blocked readiness
 
 | Reason (prefix) | Meaning | Action |
 | --- | --- | --- |
-| `Node A has not run yet…` | the upstream has no Attempt, or none that is terminal | run A to a terminal Decision first |
+| `Node A has not run yet…` | the upstream has no Attempt yet, or its latest is not terminal (running, awaiting a Decision) | run A to a terminal Decision first |
+| `…its latest Attempt is cancelled.` | the upstream's only Attempt was cancelled — **terminal**, like rejection, but reported `blocked` by design | create a new Mission; no Retry or second initial Attempt exists for a cancelled Task |
 | `Node A is approved but its output has not been promoted yet; promote it first.` | approval exists, delivery does not | promote A from its Attempt review, confirming the exact digest |
 | `Node A is approved but cannot be promoted: …` | A's promotion is currently blocked (e.g. drifted review) | fix the named cause — the reason is A's actual `promotionEligibility` reason, not generic advice |
 | `Node A's promoted output could not be re-verified…` | the ref could not be read right now (unconfirmed) | restore repository readability; no other action needed |
