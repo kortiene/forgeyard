@@ -114,7 +114,23 @@ describe('Milestone 1: one verified Attempt', () => {
   afterEach(async () => {
     try { store.close() } catch { /* A test may close the store to simulate restart. */ }
     await runtime.dispose()
-    await rm(root, { recursive: true, force: true })
+    // The confined verifier subprocess and its landlock launcher can still be
+    // unwinding when the test body ends, so a single rm can observe a directory
+    // that is momentarily not empty again. Retrying with backoff keeps teardown
+    // deterministic without weakening any assertion; an output that genuinely
+    // cannot be removed still fails the run.
+    let lastError: unknown
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try {
+        await rm(root, { recursive: true, force: true })
+        lastError = undefined
+        break
+      } catch (error) {
+        lastError = error
+        await new Promise(resolve => setTimeout(resolve, 100 * (attempt + 1)))
+      }
+    }
+    if (lastError !== undefined) throw lastError
   })
 
   function missionRequest(): MissionCreateRequest {

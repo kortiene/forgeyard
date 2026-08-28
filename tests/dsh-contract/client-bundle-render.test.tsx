@@ -210,6 +210,144 @@ describe('built Forgeyard browser face', () => {
     for (const cleanup of cleanups.reverse()) cleanup()
   })
 
+  it('warns that an approved terminal node\'s output is undelivered, and stops once it is promoted or blocked', async () => {
+    const client = await executeBuiltClientFace()
+    const entries = new Map<string, SlotEntry>()
+    const cleanups: Array<() => void> = []
+
+    // Approved and still promotable: the criterion-11 warning is visible.
+    const eligible = snapshotFixture()
+    const eligibleAttempt = approveMissionFixture(eligible)
+    expect(eligibleAttempt.promotion.eligible).toBe(true)
+    const warningCtx = fakeClientContext(entries, cleanups, eligible, identityResult, {})
+    await act(async () => { await client.apply(warningCtx as never) })
+    let footer = await mount(<Slot entry={required(entries, 'sidebar.footer.action')} runtime={{ wide: true }} />)
+    let overlay = await mount(<Slot entry={required(entries, 'shell.overlay')} />)
+    await click(await waitForElement(() => namedButton(footer.container, /Open Forgeyard/u)))
+    await waitForElement(() => overlay.container.querySelector('[role="dialog"]'))
+    await click(requiredElement(namedButton(overlay.container, /Browser mission/u), 'mission button'))
+    const warning = requiredElement(
+      overlay.container.querySelector<HTMLParagraphElement>('p.fy-node-warning[role="status"]'),
+      'unpromoted output warning',
+    )
+    expect(warning.textContent).toContain('Approved output not yet promoted')
+    expect(warning.textContent).toContain('permanently unpromotable')
+    await overlay.unmount()
+    await footer.unmount()
+    for (const cleanup of cleanups.splice(0)) cleanup()
+
+    // Promoted: the output is delivered, so no warning.
+    const promoted = snapshotFixture()
+    const promotedAttempt = approveMissionFixture(promoted)
+    promotedAttempt.promotion = {
+      ...promotedAttempt.promotion,
+      status: 'promoted',
+      eligible: false,
+      reason: 'This Attempt was already promoted.',
+      promotionId: 'promotion-1',
+      outputRef: 'refs/forgeyard/promotions/attempt-1',
+      outputCommit: '7'.repeat(40),
+    }
+    const promotedCtx = fakeClientContext(entries, cleanups, promoted, identityResult, {})
+    await act(async () => { await client.apply(promotedCtx as never) })
+    footer = await mount(<Slot entry={required(entries, 'sidebar.footer.action')} runtime={{ wide: true }} />)
+    overlay = await mount(<Slot entry={required(entries, 'shell.overlay')} />)
+    await click(await waitForElement(() => namedButton(footer.container, /Open Forgeyard/u)))
+    await waitForElement(() => overlay.container.querySelector('[role="dialog"]'))
+    await click(requiredElement(namedButton(overlay.container, /Browser mission/u), 'mission button'))
+    expect(overlay.container.querySelector('p.fy-node-warning')).toBeNull()
+    await overlay.unmount()
+    await footer.unmount()
+    for (const cleanup of cleanups.splice(0)) cleanup()
+
+    // Approved but blocked from promotion (drifted review): the reason line
+    // already explains why, and the warning does not advise a lost action.
+    const blocked = snapshotFixture()
+    const blockedAttempt = approveMissionFixture(blocked)
+    blockedAttempt.promotion = {
+      ...blockedAttempt.promotion,
+      status: 'blocked',
+      eligible: false,
+      reason: 'The approved reviewed state is no longer current.',
+    }
+    const blockedCtx = fakeClientContext(entries, cleanups, blocked, identityResult, {})
+    await act(async () => { await client.apply(blockedCtx as never) })
+    footer = await mount(<Slot entry={required(entries, 'sidebar.footer.action')} runtime={{ wide: true }} />)
+    overlay = await mount(<Slot entry={required(entries, 'shell.overlay')} />)
+    await click(await waitForElement(() => namedButton(footer.container, /Open Forgeyard/u)))
+    await waitForElement(() => overlay.container.querySelector('[role="dialog"]'))
+    await click(requiredElement(namedButton(overlay.container, /Browser mission/u), 'mission button'))
+    expect(overlay.container.querySelector('p.fy-node-warning')).toBeNull()
+    await overlay.unmount()
+    await footer.unmount()
+    for (const cleanup of cleanups.splice(0).reverse()) cleanup()
+  })
+
+  it('keeps the undelivered-output warning on a node that reached approval through a retry', async () => {
+    const client = await executeBuiltClientFace()
+    const entries = new Map<string, SlotEntry>()
+    const cleanups: Array<() => void> = []
+
+    const data = snapshotFixture()
+    const node = data.missions[0]?.tasks[0]
+    const attempt = node?.attempts[0]
+    if (node === undefined || attempt === undefined) throw new Error('missing Mission node fixture')
+
+    // Prepend a retried predecessor so the approved Attempt is the LAST entry
+    // in wire order (oldest first) while the display sort puts it FIRST. The
+    // warning must read the latest Attempt, not the display-sorted tail.
+    const predecessor: AttemptView = {
+      ...structuredClone(attempt),
+      attempt: {
+        ...structuredClone(attempt.attempt),
+        id: 'attempt-0',
+        ordinal: 1,
+        retryOfAttemptId: null,
+        successorAttemptId: 'attempt-1',
+        dshSessionId: 'session-0',
+        state: 'retried',
+      },
+    }
+    const approved = structuredClone(attempt)
+    approved.attempt = { ...approved.attempt, id: 'attempt-1', ordinal: 2, state: 'approved' }
+    approved.promotion = {
+      ...approved.promotion,
+      status: 'eligible',
+      eligible: true,
+      reason: null,
+    }
+    node.attempts = [predecessor, approved]
+    node.nodeState = 'approved'
+    node.readiness = {
+      status: 'ready',
+      startable: false,
+      reason: 'This Task is approved; starting another initial Attempt is not allowed.',
+      blockedBy: [],
+      baseCommit: null,
+      baseFromAttemptId: null,
+    }
+    const mission = data.missions[0]
+    if (mission === undefined) throw new Error('missing Mission fixture')
+    mission.derivedState = 'complete'
+
+    const ctx = fakeClientContext(entries, cleanups, data, identityResult, {})
+    await act(async () => { await client.apply(ctx as never) })
+    const footer = await mount(<Slot entry={required(entries, 'sidebar.footer.action')} runtime={{ wide: true }} />)
+    const overlay = await mount(<Slot entry={required(entries, 'shell.overlay')} />)
+    await click(await waitForElement(() => namedButton(footer.container, /Open Forgeyard/u)))
+    await waitForElement(() => overlay.container.querySelector('[role="dialog"]'))
+    await click(requiredElement(namedButton(overlay.container, /Browser mission/u), 'mission button'))
+    const warning = requiredElement(
+      overlay.container.querySelector<HTMLParagraphElement>('p.fy-node-warning[role="status"]'),
+      'unpromoted output warning after retry',
+    )
+    expect(warning.textContent).toContain('Approved output not yet promoted')
+
+    await overlay.unmount()
+    await footer.unmount()
+    for (const cleanup of cleanups.splice(0).reverse()) cleanup()
+  })
+
   it('renders promotion eligibility, requires explicit confirmation, and shows the durable result', async () => {
     const client = await executeBuiltClientFace()
     const entries = new Map<string, SlotEntry>()
@@ -397,6 +535,10 @@ async function waitForElement<T extends Element>(read: () => T | null): Promise<
   throw new Error('expected browser element did not render')
 }
 
+/** An ok-wrapped result resolver shared by tests that only need the snapshot. */
+const identityResult = <T,>(value: T): Promise<{ ok: true; value: { ok: true; value: T } }> =>
+  Promise.resolve({ ok: true, value: { ok: true, value } })
+
 async function waitFor(read: () => boolean): Promise<void> {
   for (let index = 0; index < 50; index += 1) {
     if (read()) return
@@ -471,6 +613,14 @@ function approveMissionFixture(data: ForgeyardSnapshot): AttemptView {
     baseFromAttemptId: null,
   }
   mission.derivedState = 'complete'
+  // Approved terminal work is promotable until its reviewed state drifts, so an
+  // honest fixture exposes an eligible promotion rather than a blocked one.
+  attempt.promotion = {
+    ...attempt.promotion,
+    status: 'eligible',
+    eligible: true,
+    reason: null,
+  }
   return attempt
 }
 

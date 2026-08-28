@@ -132,6 +132,8 @@ export const FORGEYARD_CSS = String.raw`
 .fy-node-statuses > span { display: inline-flex; align-items: center; gap: 6px; color: var(--fy-muted); font-size: 9px; font-weight: 700; text-transform: uppercase; }
 .fy-node-meta { display: flex; flex-wrap: wrap; gap: 12px; color: var(--fy-muted); font-size: 10px; }
 .fy-node-reason { padding: 9px 11px; border-left: 3px solid var(--fy-amber); background: #fff9ec; color: #72521b; font-size: 10px; line-height: 1.5; }
+.fy-node-warning { display: grid; gap: 3px; padding: 10px 11px; border-left: 3px solid var(--fy-red); background: #fff5f4; color: #6d3b34; font-size: 10px; line-height: 1.5; }
+.fy-node-warning strong { font-size: 10px; }
 .fy-node-actions { display: flex; justify-content: flex-end; }
 .fy-table, .fy-check-list, .fy-evidence-list { display: grid; gap: 7px; }
 .fy-attempt-row {
