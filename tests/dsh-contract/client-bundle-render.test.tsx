@@ -12,6 +12,7 @@ import type {
   PromotionEligibility,
   PromotionProjection,
   PromotionRecord,
+  TaskNodeView,
 } from '../../packages/forgeyard/src/types.ts'
 
 interface SlotEntry {
@@ -348,6 +349,75 @@ describe('built Forgeyard browser face', () => {
     for (const cleanup of cleanups.splice(0).reverse()) cleanup()
   })
 
+  it('renders a serial Pipe: both node cards in frozen order, the blocking reason, and the propagated base', async () => {
+    const client = await executeBuiltClientFace()
+    const entries = new Map<string, SlotEntry>()
+    const cleanups: Array<() => void> = []
+    const nodeCardLabels = (container: ParentNode): string[] =>
+      [...container.querySelectorAll('article[aria-label^="Task node "]')]
+        .map(card => card.getAttribute('aria-label'))
+
+    // Stage 1: A approved but not delivered — B is blocked on A's missing output.
+    const blocked = serialSnapshotFixture()
+    const blockedCtx = fakeClientContext(entries, cleanups, blocked, identityResult, {})
+    await act(async () => { await client.apply(blockedCtx as never) })
+    let footer = await mount(<Slot entry={required(entries, 'sidebar.footer.action')} runtime={{ wide: true }} />)
+    let overlay = await mount(<Slot entry={required(entries, 'shell.overlay')} />)
+    await click(await waitForElement(() => namedButton(footer.container, /Open Forgeyard/u)))
+    await waitForElement(() => overlay.container.querySelector('[role="dialog"]'))
+    await click(requiredElement(namedButton(overlay.container, /Serial pipe mission/u), 'mission button'))
+    expect(heading(overlay.container, 'Task nodes')).not.toBeNull()
+    // Frozen Pipe order, not insertion or ID order: A renders before B.
+    expect(nodeCardLabels(overlay.container)).toEqual(['Task node A', 'Task node B'])
+    expect(overlay.container.textContent).toContain('Readiness Blocked')
+    expect(overlay.container.textContent).toContain('Readiness Ready')
+    const blockedCard = requiredElement(
+      overlay.container.querySelector('article[aria-label="Task node B"]'),
+      'downstream node card',
+    )
+    expect(requiredElement(
+      blockedCard.querySelector<HTMLParagraphElement>('p.fy-node-reason'),
+      'downstream blocking reason',
+    ).textContent).toContain('Node A is approved but its output has not been promoted yet')
+    expect(blockedCard.textContent).toContain('1 dependency')
+    expect(blockedCard.textContent).not.toContain('base ')
+    const blockedStart = requiredElement(namedButton(blockedCard, /Start attempt/u), 'downstream start button')
+    expect(blockedStart.disabled).toBe(true)
+    // A is approved and still promotable, so the criterion-11 warning sits on A.
+    expect(requiredElement(
+      overlay.container.querySelector('article[aria-label="Task node A"] p.fy-node-warning[role="status"]'),
+      'upstream undelivered-output warning',
+    ).textContent).toContain('Approved output not yet promoted')
+    await overlay.unmount()
+    await footer.unmount()
+    for (const cleanup of cleanups.splice(0)) cleanup()
+
+    // Stage 2: A promoted — B becomes ready on the propagated base commit.
+    const ready = serialSnapshotFixture()
+    promoteUpstreamFixture(ready)
+    const readyCtx = fakeClientContext(entries, cleanups, ready, identityResult, {})
+    await act(async () => { await client.apply(readyCtx as never) })
+    footer = await mount(<Slot entry={required(entries, 'sidebar.footer.action')} runtime={{ wide: true }} />)
+    overlay = await mount(<Slot entry={required(entries, 'shell.overlay')} />)
+    await click(await waitForElement(() => namedButton(footer.container, /Open Forgeyard/u)))
+    await waitForElement(() => overlay.container.querySelector('[role="dialog"]'))
+    await click(requiredElement(namedButton(overlay.container, /Serial pipe mission/u), 'mission button'))
+    expect(nodeCardLabels(overlay.container)).toEqual(['Task node A', 'Task node B'])
+    const readyCard = requiredElement(
+      overlay.container.querySelector('article[aria-label="Task node B"]'),
+      'downstream node card',
+    )
+    expect(readyCard.querySelector('p.fy-node-reason')).toBeNull()
+    // The propagated base is A's promoted commit, shown in short form.
+    expect(readyCard.textContent).toContain(`base ${'7'.repeat(12)}`)
+    const readyStart = requiredElement(namedButton(readyCard, /Start attempt/u), 'downstream start button')
+    expect(readyStart.disabled).toBe(false)
+    expect(overlay.container.querySelector('p.fy-node-warning')).toBeNull()
+    await overlay.unmount()
+    await footer.unmount()
+    for (const cleanup of cleanups.splice(0).reverse()) cleanup()
+  })
+
   it('renders promotion eligibility, requires explicit confirmation, and shows the durable result', async () => {
     const client = await executeBuiltClientFace()
     const entries = new Map<string, SlotEntry>()
@@ -622,6 +692,95 @@ function approveMissionFixture(data: ForgeyardSnapshot): AttemptView {
     reason: null,
   }
   return attempt
+}
+
+/**
+ * A two-node serial Mission view in the shape the engine's readiness
+ * projection emits: A approved but undelivered, B blocked on A's missing
+ * promotion. Every field mirrors the real wire values — B's reason is the
+ * exact `upstreamOutput` text and `dependencies` names A's TaskId — so the
+ * render assertions describe the shipped Cockpit, not a hand-wished shape.
+ */
+function serialSnapshotFixture(): ForgeyardSnapshot {
+  const data = snapshotFixture()
+  const mission = data.missions[0]
+  const upstream = mission?.tasks[0]
+  const upstreamAttempt = upstream?.attempts[0]
+  if (mission === undefined || upstream === undefined || upstreamAttempt === undefined) {
+    throw new Error('missing Mission node fixture')
+  }
+  const requirement = upstream.task.specification.verification[0]
+  if (requirement === undefined) throw new Error('missing verification fixture')
+  mission.mission.title = 'Serial pipe mission'
+  mission.mission.pipe = {
+    nodes: [
+      { key: 'A', task: 'Implement A.', verify: [structuredClone(requirement)], dependsOn: [] },
+      { key: 'B', task: 'Deliver the follow-up change.', verify: [structuredClone(requirement)], dependsOn: ['A'] },
+    ],
+  }
+  upstream.task.sourceNodeKey = 'A'
+  upstream.task.dependencies = []
+  approveMissionFixture(data)
+  const downstream: TaskNodeView = {
+    task: {
+      id: 'task-2',
+      missionId: 'mission-1',
+      sourceNodeKey: 'B',
+      specification: {
+        title: 'Serial follow-up',
+        objective: 'Prove the serial Pipe rendering.',
+        instruction: 'Deliver the follow-up change.',
+        verification: [structuredClone(requirement)],
+      },
+      dependencies: [upstream.task.id],
+      createdAt: 2,
+    },
+    attempts: [],
+    readiness: {
+      status: 'blocked',
+      startable: false,
+      reason: 'Node A is approved but its output has not been promoted yet; promote it first.',
+      blockedBy: ['A'],
+      baseCommit: null,
+      baseFromAttemptId: null,
+    },
+    nodeState: 'ready',
+  }
+  mission.tasks = [upstream, downstream]
+  // Approved A (non-startable) plus blocked B rolls up to `blocked`.
+  mission.derivedState = 'blocked'
+  return data
+}
+
+/** Deliver A: one Promotion record, the promoted eligibility panel, B ready on the propagated base. */
+function promoteUpstreamFixture(data: ForgeyardSnapshot): void {
+  const mission = data.missions[0]
+  const upstream = mission?.tasks[0]
+  const downstream = mission?.tasks[1]
+  const attempt = upstream?.attempts[0]
+  if (mission === undefined || upstream === undefined || downstream === undefined || attempt === undefined) {
+    throw new Error('missing serial Mission fixture')
+  }
+  const outputCommit = '7'.repeat(40)
+  attempt.promotions = [promotionRecordFixture(attempt.review.reviewDigest, outputCommit)]
+  attempt.promotion = {
+    ...attempt.promotion,
+    status: 'promoted',
+    eligible: false,
+    reason: 'This Attempt was already promoted.',
+    promotionId: 'promotion-1',
+    outputRef: 'refs/forgeyard/promotions/attempt-1',
+    outputCommit,
+  }
+  downstream.readiness = {
+    status: 'ready',
+    startable: true,
+    reason: null,
+    blockedBy: [],
+    baseCommit: outputCommit,
+    baseFromAttemptId: attempt.attempt.id,
+  }
+  mission.derivedState = 'ready'
 }
 
 function fakeClientContext(
