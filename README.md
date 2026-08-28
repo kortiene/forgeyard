@@ -128,7 +128,7 @@ The provider-driven acceptance harness requires a usable configured provider and
 pnpm smoke:native
 ```
 
-See [the Milestone 1 acceptance runbook](docs/milestone-1-acceptance.md) for case-sensitive filesystem requirements, provider overrides, evidence assertions, and fail-closed interpretation, and [the Milestone 2 acceptance runbook](docs/milestone-2-acceptance.md) for the promotion projection, eligibility rules, restart semantics, and Cockpit flow.
+See [the Milestone 1 acceptance runbook](docs/milestone-1-acceptance.md) for case-sensitive filesystem requirements, provider overrides, evidence assertions, and fail-closed interpretation; [the Milestone 2 acceptance runbook](docs/milestone-2-acceptance.md) for the promotion projection, eligibility rules, restart semantics, and Cockpit flow; and [the Milestone 3 acceptance runbook](docs/milestone-3-acceptance.md) for the serial-Pipe contract, dependency resolution and divergence re-blocking, chain inspection with ordinary Git, and the current host-capability notes.
 
 This `DSH_HOME=$PWD` arrangement is a development convenience. Do not select the Forgeyard checkout itself as a Mission repository in that arrangement: an Attempt worktree root must be outside its selected base repository. Use a separate DSH home/profile installation for that case.
 
@@ -137,7 +137,7 @@ The default bundle configuration writes `forgeyard.sqlite` and `forgeyard-worktr
 In the Cockpit:
 
 1. Create a Mission with a repository, base ref, objective, and either one root Task node or one root plus one explicit serial follow-up. Each node freezes its own instruction and verification command; both share the Mission policy.
-2. Start the root Task's Attempt. A follow-up is visible but remains blocked until upstream promotion and propagated-base admission land in the next Milestone 3 slice. Forgeyard creates and permanently binds the worktree and native DSH Session.
+2. Start the root Task's Attempt. A serial follow-up is visible but remains blocked — with the same reason the Host engine refuses admission — until its upstream node reaches an approved, promoted, re-verified output; it is then admitted on exactly that propagated base commit. Forgeyard creates and permanently binds the worktree and native DSH Session.
 3. Enter the Session from Attempt review. The overlay closes before `ctx.sessions.open(sessionId)` runs.
 4. Use the Session-header Forgeyard action to return to the exact Attempt, then explicitly request Verification. Forgeyard safely cold-resumes a persisted Session through the public `sessions.models` API when needed, validates the frozen execution policy, and claims the exact Agent's maintenance phase instead of racing execution.
 5. Inspect Git Evidence, command Evidence, Verification, and the review digest. Approve is available only for a current, complete, all-passing review; Reject, Retry, and Cancel remain explicit append-only Decisions.
@@ -186,7 +186,8 @@ The [`safety-gate` workflow](.github/workflows/safety-gate.yml) runs `pnpm check
 - `profiles/local/` — the single local DSH Web profile;
 - `tests/dsh-contract/`, `tests/real-git/`, `tests/vertical-slice/` — compatibility and acceptance boundaries;
 - `docs/adr/` — architectural decisions;
-- `docs/milestone-2-acceptance.md` — the promotion operator runbook.
+- `docs/milestone-2-acceptance.md` — the promotion operator runbook;
+- `docs/milestone-3-acceptance.md` — the serial-Pipe acceptance runbook.
 
 The one runtime package is a DSH packaging boundary, not a split into domain micro-packages.
 
